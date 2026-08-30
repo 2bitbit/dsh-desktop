@@ -1,0 +1,20 @@
+# Build output
+/bin/
+/build/
+/dist/
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+
+# Runtime logs
+*.log
+dsh_pwa_shim.log
+
+# IDE & OS files
+.vscode/
+.idea/
+*.lnk
+Thumbs.db
+[Dd]esktop.ini
