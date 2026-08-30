@@ -1,10 +1,7 @@
-# dsh-desktop (DSH PWA Shim)
+# dsh-desktop
 
 <p align="center">
-  <b>A lightweight, zero-overhead native Windows lifecycle shim & launcher for DeepSeek Harness (<code>@deepseek-ai/dsh</code>) PWA.</b>
-</p>
-
-<p align="center">
+  <b>Lightweight, zero-overhead native Windows lifecycle shim & launcher for DeepSeek Harness (<code>@deepseek-ai/dsh</code>) PWA.</b><br>
   <a href="https://github.com/2bitbit/dsh-desktop/releases/latest"><img src="https://img.shields.io/github/v/release/2bitbit/dsh-desktop?color=blue&label=Release" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-blue" alt="Platform">
@@ -12,139 +9,66 @@
   <a href="README.md">简体中文版本</a>
 </p>
 
----
-
-## 📖 Table of Contents
-
-- [Why dsh-desktop?](#why-dsh-desktop)
-- [Key Features](#key-features)
-- [Architecture & Lifecycle](#architecture--lifecycle)
-- [Quick Start](#quick-start)
-- [Package Manager Compatibility](#package-manager-compatibility)
-- [Building from Source](#building-from-source)
-- [CLI Arguments](#cli-arguments)
-- [License](#-license)
+<p align="center">
+  <img src="demo.png" alt="dsh-desktop Demo" width="800">
+</p>
 
 ---
 
-## Why dsh-desktop?
+## Highlights
 
-When using `dsh web`, Windows developers usually encounter several pain points:
-1. **Console Window Clutter**: Launching via `pwsh` or `cmd` generates an annoying persistent black terminal window.
-2. **Zombie Process & Port Leak**: Closing the browser window does not terminate background `node.exe` processes, locking port `3080`.
-3. **Slow Cold Startup**: Shell initialization profiles add hundreds of milliseconds of latency.
-
-`dsh-desktop` solves all of these issues by providing a **~107KB native C++ Win32 GUI shim** that manages the entire lifecycle seamlessly.
-
----
-
-## Key Features
-
-- ⚡ **Direct Node.js Bypass**: Automatically locates `@deepseek-ai/dsh` across global `npm`, `pnpm`, and `yarn` directories, launching directly via `node.exe` with zero shell startup overhead.
-- 🪟 **Zero Console Black Windows**: Native Win32 `WinMain` entrypoint with explicit `NUL` device redirection to prevent stdout/stderr pipe crashes in windowless mode.
-- 🛡️ **Strict Job Object Supervision**: Configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and breakaway prevention. When the shim closes, all child node processes are killed instantly.
-- ⏱️ **30ms Fast Probing**: 30ms non-blocking socket check for `127.0.0.1:3080` readiness and fast PWA window HWND/PID capture.
-- 💤 **Pure Event-Driven (0% CPU)**: Leverages `SetWinEventHook` (`EVENT_OBJECT_DESTROY`) + `MsgWaitForMultipleObjects` to sleep until the PWA window is closed. Zero polling, zero CPU usage.
-- 📁 **Per-Project Working Directory**: Accepts `--cwd <path>` / `-w <path>` via shortcut arguments to open specific project workspaces.
-- 🛡️ **Log Rotation Guard**: Self-contained `dsh_pwa_shim.log` capped at 512 KB to avoid disk bloating.
-
----
-
-## Architecture & Lifecycle
-
-```
-[ Shortcut / Launcher ] --cwd "D:\MyProject"
-         │
-         ▼
- ┌───────────────────────────────────────────────────────────┐
- │                   dsh_pwa_shim.exe                        │
- │  1. Create isolated Windows Job Object                    │
- │  2. Launch Node.js (@deepseek-ai/dsh) directly into Job   │
- │  3. 30ms non-blocking probe on 127.0.0.1:3080             │
- │  4. Launch Microsoft Edge PWA client                      │
- │  5. Capture PWA HWND & PID (30ms interval)                │
- │  6. SetWinEventHook on EVENT_OBJECT_DESTROY               │
- │  7. MsgWaitForMultipleObjects (Sleep / 0% CPU)            │
- └─────────────────────────────┬─────────────────────────────┘
-                               │ (User Closes PWA Window)
-                               ▼
- ┌───────────────────────────────────────────────────────────┐
- │                   Instant Teardown                        │
- │  - WinEventHook triggered                                 │
- │  - TerminateJobObject kills all node processes instantly   │
- │  - Port 3080 released immediately                         │
- └───────────────────────────────────────────────────────────┘
-```
+- **Zero Console Clutter**: Native Win32 GUI entrypoint with `NUL` IO redirection—no black terminal windows.
+- **Strict Process Supervision**: Windows Job Object binding ensures all `node.exe` processes terminate when the PWA closes—**zero zombie processes, instant port 3080 release**.
+- **Direct Node.js Bypass**: Auto-detects global `npm` / `pnpm` / `yarn` modules to bypass shell startup latency (cascades to `pwsh` → `powershell` → `cmd` if needed).
+- **0% CPU Idle**: Win32 `SetWinEventHook` + `MsgWaitForMultipleObjects` sleep until the window closes—**zero polling, zero CPU overhead**.
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-1. **Node.js & DSH Installed**: Run `npm i -g @deepseek-ai/dsh` or `pnpm add -g @deepseek-ai/dsh`.
-2. **Edge PWA Installed**: Start dsh once, open `http://127.0.0.1:3080/` in Microsoft Edge, and click the "Install App" button in the address bar.
+### 1. Prerequisites
+- Global DSH: `npm i -g @deepseek-ai/dsh` or `pnpm add -g @deepseek-ai/dsh`
+- Edge PWA: Open `http://127.0.0.1:3080/` in Edge and click "Install App" in the address bar.
 
-### Option A: Pre-built Release (Recommended)
-1. Download `dsh-desktop-v1.0.0-windows-x64.zip` from [Releases](https://github.com/2bitbit/dsh-desktop/releases/latest).
-2. Extract to any directory (e.g., `D:\Tools\dsh-desktop`).
-3. Run PowerShell in that folder to create shortcuts:
-   ```powershell
-   .\install_shortcut.ps1 -TargetDirectory "D:\Your\Workspace\Directory"
-   ```
+### 2. Create Shortcuts
+Download and extract the [Latest Release](https://github.com/2bitbit/dsh-desktop/releases/latest), then run in PowerShell:
 
-### Option B: Build from Source
 ```powershell
-git clone https://github.com/2bitbit/dsh-desktop.git
-cd dsh-desktop
-.\scripts\build.ps1
-.\scripts\install_shortcut.ps1 -TargetDirectory "D:\Your\Workspace\Directory"
+.\install_shortcut.ps1 -TargetDirectory "D:\Your\Workspace"
+```
+> Generates desktop & start menu shortcuts bound to your project folder.
+
+---
+
+## Architecture
+
+```
+Shortcut (--cwd <dir>) ──> dsh_pwa_shim.exe ──(Job Object)──> Node.js (dsh web)
+                                │
+                                ├─ 30ms TCP probe on port 3080
+                                ├─ Launch Edge PWA & capture HWND/PID
+                                └─ Sleep (0% CPU) ──[Close Window]──> Instant Job tree teardown
 ```
 
 ---
 
-## Package Manager Compatibility
+## CLI Options
 
-`dsh-desktop` includes automatic entrypoint detection with multi-tiered shell fallback:
-
-| Tier | Target / Mechanism | Condition |
+| Option | Description | Example |
 | :--- | :--- | :--- |
-| **Direct Phase 1** | `npm` global directory (`%APPDATA%\npm\node_modules`) | Installed via `npm i -g` |
-| **Direct Phase 2** | `pnpm` global directory (`%LOCALAPPDATA%\pnpm\global\*`) | Installed via `pnpm add -g` |
-| **Direct Phase 3** | `yarn` global directory (`%LOCALAPPDATA%\Yarn\Data\global`) | Installed via `yarn global add` |
-| **Fallback Tier 1** | `pwsh.exe` (PowerShell 7) | System with PS7 installed |
-| **Fallback Tier 2** | `powershell.exe` (Windows PowerShell 5.1) | Standard on all Windows 10/11 |
-| **Fallback Tier 3** | `cmd.exe` (Command Prompt) | Ultimate fallback |
+| `--cwd <path>` / `-w <path>` | Set DSH working directory | `dsh_pwa_shim.exe --cwd "D:\Projects\Demo"` |
+| `--debug` / `-d` | Enable debug logging & dialogs | `dsh_pwa_shim.exe --debug` |
 
 ---
 
-## Building from Source
-
-Requirements: Any modern C++17 compiler (`g++` / MinGW-w64, `clang++`, or MSVC `cl.exe`).
+## Build from Source
 
 ```powershell
-# Auto-detect compiler and build optimized release binary
 .\scripts\build.ps1
-
-# Manually specify compiler
-.\scripts\build.ps1 -Compiler GCC
-.\scripts\build.ps1 -Compiler Clang
-.\scripts\build.ps1 -Compiler MSVC
-
-# Build with debug symbols
-.\scripts\build.ps1 -DebugBuild
 ```
 
 ---
 
-## CLI Arguments
+## License
 
-| Argument | Description | Example |
-| :--- | :--- | :--- |
-| `--cwd <path>` / `-w <path>` | Set working directory for the background DSH server | `dsh_pwa_shim.exe --cwd "D:\Projects\Demo"` |
-| `--debug` / `-d` | Enable debug logging and error popup dialogs | `dsh_pwa_shim.exe --debug` |
-
----
-
-## 📄 License
-
-This project is open source under the [MIT License](LICENSE).
+[MIT License](LICENSE)
