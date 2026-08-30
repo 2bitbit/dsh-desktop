@@ -4,7 +4,7 @@
   <b>DeepSeek Harness (<code>@deepseek-ai/dsh</code>) 的原生 Windows 桌面极速守护与生命周期联动 Shim</b><br>
   <a href="https://github.com/2bitbit/dsh-desktop/releases/latest"><img src="https://img.shields.io/github/v/release/2bitbit/dsh-desktop?color=blue&label=Release" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-blue" alt="Platform">
+  <img src="https://img.shields.io/badge/Platform-Windows%20Only%20(10%2F11%20x64)-blue" alt="Platform">
   <br>
   <a href="README.md.en">English Version</a>
 </p>
@@ -12,6 +12,9 @@
 <p align="center">
   <img src="demo.png" alt="dsh-desktop Demo" width="800">
 </p>
+
+> [!IMPORTANT]
+> **平台限制**：本项目深度依赖 Win32 GUI、Windows Job Object 与 WinEventHook 等 Windows 原生内核机制，**仅限 Windows 系统（Windows 10 / 11 x64）使用**。
 
 ---
 
@@ -40,7 +43,7 @@
 # 参数模式：指定特定工作目录与快捷方式名称
 .\install_shortcut.ps1 -TargetDirectory "D:\Workspace\MyProject"
 ```
-> 💡 **作用说明**：生成的快捷方式**完全等效于在该目录下执行 `dsh web --no-open` 并自动唤起/接管 Edge PWA 窗口**。
+> 💡 **作用说明**：将在**桌面与开始菜单**生成专属快捷方式，点击**完全等效于在该目录下执行 `dsh web --no-open` 并自动唤起/接管 Edge PWA 窗口**。
 
 ---
 

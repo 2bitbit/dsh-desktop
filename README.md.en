@@ -4,7 +4,7 @@
   <b>Lightweight, zero-overhead native Windows lifecycle shim & launcher for DeepSeek Harness (<code>@deepseek-ai/dsh</code>) PWA.</b><br>
   <a href="https://github.com/2bitbit/dsh-desktop/releases/latest"><img src="https://img.shields.io/github/v/release/2bitbit/dsh-desktop?color=blue&label=Release" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-blue" alt="Platform">
+  <img src="https://img.shields.io/badge/Platform-Windows%20Only%20(10%2F11%20x64)-blue" alt="Platform">
   <br>
   <a href="README.md">简体中文版本</a>
 </p>
@@ -12,6 +12,9 @@
 <p align="center">
   <img src="demo.png" alt="dsh-desktop Demo" width="800">
 </p>
+
+> [!IMPORTANT]
+> **Platform Notice**: This project relies heavily on Win32 GUI, Windows Job Object, and WinEventHook kernel mechanisms. It is **Windows-only (Windows 10 / 11 x64)**.
 
 ---
 
@@ -40,7 +43,7 @@ Download and extract the [Latest Release](https://github.com/2bitbit/dsh-desktop
 # CLI Mode: specify the target directory directly
 .\install_shortcut.ps1 -TargetDirectory "D:\Your\Workspace"
 ```
-> 💡 **Equivalent Command**: Clicking the created shortcut is **equivalent to executing `dsh web --no-open` in that directory and automatically launching/managing the Edge PWA window**.
+> 💡 **Usage**: Generates dedicated shortcuts on both your **Desktop and Start Menu**. Clicking the shortcut is **completely equivalent to running `dsh web --no-open` in that directory and automatically launching/managing the Edge PWA window**.
 
 ---
 
