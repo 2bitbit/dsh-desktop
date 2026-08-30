@@ -34,9 +34,13 @@
 Download and extract the [Latest Release](https://github.com/2bitbit/dsh-desktop/releases/latest), then run in PowerShell:
 
 ```powershell
+# Interactive Mode: pops up a folder picker to choose your workspace
+.\install_shortcut.ps1
+
+# CLI Mode: specify the target directory directly
 .\install_shortcut.ps1 -TargetDirectory "D:\Your\Workspace"
 ```
-> Generates desktop & start menu shortcuts bound to your project folder.
+> 💡 **Equivalent Command**: Clicking the created shortcut is **equivalent to executing `dsh web --no-open` in that directory and automatically launching/managing the Edge PWA window**.
 
 ---
 
@@ -56,7 +60,7 @@ Shortcut (--cwd <dir>) ──> dsh_pwa_shim.exe ──(Job Object)──> Node.j
 
 | Option | Description | Example |
 | :--- | :--- | :--- |
-| `--cwd <path>` / `-w <path>` | Set DSH working directory | `dsh_pwa_shim.exe --cwd "D:\Projects\Demo"` |
+| `--cwd <path>` / `-w <path>` | Set DSH working directory (equivalent to running `dsh web` inside it) | `dsh_pwa_shim.exe --cwd "D:\Projects\Demo"` |
 | `--debug` / `-d` | Enable debug logging & dialogs | `dsh_pwa_shim.exe --debug` |
 
 ---

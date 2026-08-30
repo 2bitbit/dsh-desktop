@@ -34,9 +34,13 @@
 下载 [最新 Release 压缩包](https://github.com/2bitbit/dsh-desktop/releases/latest) 解压后，在 PowerShell 中执行：
 
 ```powershell
-.\install_shortcut.ps1 -TargetDirectory "D:\你的代码工作目录"
+# 交互模式：直接运行，将自动弹出文件夹选择框点选工作目录
+.\install_shortcut.ps1
+
+# 参数模式：指定特定工作目录与快捷方式名称
+.\install_shortcut.ps1 -TargetDirectory "D:\Workspace\MyProject"
 ```
-> 将在桌面与开始菜单生成带专属图标、指定工作区的快捷方式。
+> 💡 **作用说明**：生成的快捷方式**完全等效于在该目录下执行 `dsh web --no-open` 并自动唤起/接管 Edge PWA 窗口**。
 
 ---
 
@@ -56,7 +60,7 @@
 
 | 参数 | 说明 | 示例 |
 | :--- | :--- | :--- |
-| `--cwd <path>` / `-w <path>` | 指定后台 DSH 工作目录 | `dsh_pwa_shim.exe --cwd "D:\Projects\Demo"` |
+| `--cwd <path>` / `-w <path>` | 指定后台 DSH 工作目录 (等效于在该目录下执行 `dsh web`) | `dsh_pwa_shim.exe --cwd "D:\Projects\Demo"` |
 | `--debug` / `-d` | 启用调试日志与弹窗报错 | `dsh_pwa_shim.exe --debug` |
 
 ---
