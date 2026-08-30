@@ -5,6 +5,12 @@
   为 <b>DeepSeek Harness</b> 打造的极速、零控制台黑框、纯事件驱动的 Windows 桌面级生命周期守护程序。
 </p>
 
+<p align="center">
+  <a href="https://github.com/2bitbit/dsh-desktop/releases/latest"><img src="https://img.shields.io/github/v/release/2bitbit/dsh-desktop?color=blue&label=Release" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-blue" alt="Platform">
+</p>
+
 ---
 
 ## 📖 目录 / Table of Contents
@@ -80,18 +86,23 @@ When using `dsh web`, Windows developers usually encounter several pain points:
 ### Quick Start
 
 #### Prerequisites
-- Node.js & pnpm installed (`pnpm add -g @deepseek-ai/dsh`)
-- Microsoft Edge with DeepSeek Harness PWA installed (Navigate to `http://127.0.0.1:3080/` in Edge -> Click "Install DeepSeek Harness as App")
+1. **Node.js & DSH Installed**: Run `pnpm add -g @deepseek-ai/dsh` in terminal.
+2. **Edge PWA Installed**: Start dsh once, open `http://127.0.0.1:3080/` in Microsoft Edge, and click the "Install App" button in the address bar.
 
-#### 1. Compile
+#### Option A: Download Pre-built Release (Recommended)
+1. Download `dsh-desktop-v1.0.0-windows-x64.zip` from [Releases](https://github.com/2bitbit/dsh-desktop/releases/latest).
+2. Extract to any directory (e.g. `D:\Tools\dsh-desktop`).
+3. Run in PowerShell to create shortcuts:
+   ```powershell
+   .\install_shortcut.ps1 -TargetDirectory "D:\Your\Workspace\Directory"
+   ```
+
+#### Option B: Build from Source
 ```powershell
+git clone https://github.com/2bitbit/dsh-desktop.git
+cd dsh-desktop
 .\scripts\build.ps1
-```
-
-#### 2. Install Shortcuts
-```powershell
-# Create Start Menu & Desktop shortcuts for your sandbox directory
-.\scripts\install_shortcut.ps1 -TargetDirectory "D:\Workspace\Playgrounds\shell-sandbox"
+.\scripts\install_shortcut.ps1 -TargetDirectory "D:\Your\Workspace\Directory"
 ```
 
 ---
@@ -150,19 +161,24 @@ Requirements: Any modern C++17 compiler (`g++` / MinGW-w64, `clang++`, or MSVC `
 
 ### 快速使用
 
-#### 前提要求
-- 已安装 Node.js 与 pnpm (`pnpm add -g @deepseek-ai/dsh`)
-- 已通过 Microsoft Edge 安装 DeepSeek Harness PWA（访问 `http://127.0.0.1:3080/` 后点击地址栏的“安装应用”）
+#### 前置要求
+1. **全局安装 DSH**：终端执行 `pnpm add -g @deepseek-ai/dsh`。
+2. **Edge 中安装 PWA**：启动一次 DSH，浏览器访问 `http://127.0.0.1:3080/` 后，点击 Edge 地址栏右侧的“安装应用”。
 
-#### 1. 编译
+#### 方式 A：直接下载预编译发布包（推荐）
+1. 前往 [Releases](https://github.com/2bitbit/dsh-desktop/releases/latest) 下载 `dsh-desktop-v1.0.0-windows-x64.zip`。
+2. 解压至任意目录（如 `D:\Tools\dsh-desktop`）。
+3. 在该目录下打开 PowerShell 创建快捷方式：
+   ```powershell
+   .\install_shortcut.ps1 -TargetDirectory "D:\你的工作区目录"
+   ```
+
+#### 方式 B：从源码编译
 ```powershell
+git clone https://github.com/2bitbit/dsh-desktop.git
+cd dsh-desktop
 .\scripts\build.ps1
-```
-
-#### 2. 一键创建快捷方式
-```powershell
-# 为指定目录创建开始菜单与桌面快捷方式
-.\scripts\install_shortcut.ps1 -TargetDirectory "D:\Workspace\Playgrounds\shell-sandbox"
+.\scripts\install_shortcut.ps1 -TargetDirectory "D:\你的工作区目录"
 ```
 
 ---
