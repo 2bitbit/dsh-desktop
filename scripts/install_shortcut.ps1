@@ -16,15 +16,30 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$rootDir = (Get-Item $PSScriptRoot).Parent.FullName
+$scriptDir = $PSScriptRoot
+$rootDir = (Get-Item $scriptDir).Parent.FullName
 
 if (-not $ExePath) {
-    $ExePath = Join-Path $rootDir "bin\dsh_pwa_shim.exe"
-}
-
-if (-not (Test-Path $ExePath)) {
-    Write-Host "Executable not found at $ExePath. Running build.ps1 first..." -ForegroundColor Yellow
-    & "$PSScriptRoot\build.ps1"
+    # 1. Check same folder as this script (Release zip package layout)
+    $siblingExe = Join-Path $scriptDir "dsh_pwa_shim.exe"
+    # 2. Check repo bin folder (Repo source layout)
+    $repoBinExe = Join-Path $rootDir "bin\dsh_pwa_shim.exe"
+    
+    if (Test-Path $siblingExe) {
+        $ExePath = $siblingExe
+    } elseif (Test-Path $repoBinExe) {
+        $ExePath = $repoBinExe
+    } else {
+        $buildScript = Join-Path $scriptDir "build.ps1"
+        if (Test-Path $buildScript) {
+            Write-Host "Executable not found. Running build.ps1 first..." -ForegroundColor Yellow
+            & $buildScript
+            $ExePath = $repoBinExe
+        } else {
+            Write-Error "Could not find dsh_pwa_shim.exe in $scriptDir or $rootDir\bin"
+            exit 1
+        }
+    }
 }
 
 $WshShell = New-Object -ComObject WScript.Shell
