@@ -122,7 +122,7 @@ std::string ToUtf8(const std::wstring& wstr);
 HANDLE InitializeJobObject();
 
 /**
- * @brief 动态解析 pnpm global 目录下的 dsh bin.js 与 NODE_PATH，实现跳过 PowerShell 直连 Node.js。
+ * @brief 动态解析 npm / pnpm / yarn 全局目录下的 dsh bin.js 与 NODE_PATH，实现跳过 Shell 直连 Node.js。
  * @param[out] outNodeExe node.exe 路径。
  * @param[out] outBinJs dsh bin.js 路径。
  * @param[out] outNodePath NODE_PATH 依赖目录。
@@ -131,7 +131,7 @@ HANDLE InitializeJobObject();
 bool ResolveDshDirectPaths(std::wstring& outNodeExe, std::wstring& outBinJs, std::wstring& outNodePath);
 
 /**
- * @brief 启动后台 dsh web 服务 (直通 Node.js 或安全回退为 pwsh)。
+ * @brief 启动后台 dsh web 服务 (直通 Node.js 或安全级联回退至 pwsh / powershell / cmd)。
  * @param workingDir 目标工作目录。
  * @param[out] pi 存储创建出的进程与主线程句柄。
  * @return 启动是否成功。
@@ -413,48 +413,113 @@ HANDLE InitializeJobObject() {
     return hJob;
 }
 
+static std::wstring ResolveNodeExecutable() {
+    wchar_t buf[MAX_PATH];
+
+    // 1. pnpm 管理的 node.exe
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH) > 0) {
+        std::wstring pnpmNode = std::wstring(buf) + L"\\pnpm\\bin\\node.exe";
+        if (PathFileExistsW(pnpmNode.c_str())) return pnpmNode;
+    }
+    if (GetEnvironmentVariableW(L"PNPM_HOME", buf, MAX_PATH) > 0) {
+        std::wstring pnpmNode = std::wstring(buf) + L"\\node.exe";
+        if (PathFileExistsW(pnpmNode.c_str())) return pnpmNode;
+    }
+
+    // 2. 官方标准安装路径 (64位 / 32位)
+    if (GetEnvironmentVariableW(L"ProgramFiles", buf, MAX_PATH) > 0) {
+        std::wstring standardNode = std::wstring(buf) + L"\\nodejs\\node.exe";
+        if (PathFileExistsW(standardNode.c_str())) return standardNode;
+    }
+    if (GetEnvironmentVariableW(L"ProgramFiles(x86)", buf, MAX_PATH) > 0) {
+        std::wstring standardNode = std::wstring(buf) + L"\\nodejs\\node.exe";
+        if (PathFileExistsW(standardNode.c_str())) return standardNode;
+    }
+
+    // 3. 依赖系统 PATH
+    return L"node.exe";
+}
+
 bool ResolveDshDirectPaths(std::wstring& outNodeExe, std::wstring& outBinJs, std::wstring& outNodePath) {
-    wchar_t localApp[MAX_PATH];
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, MAX_PATH) == 0) {
-        return false;
-    }
+    outNodeExe = ResolveNodeExecutable();
+    wchar_t buf[MAX_PATH];
 
-    std::wstring pnpmNode = std::wstring(localApp) + L"\\pnpm\\bin\\node.exe";
-    if (PathFileExistsW(pnpmNode.c_str())) {
-        outNodeExe = pnpmNode;
-    } else {
-        outNodeExe = L"node.exe";
-    }
-
-    std::wstring baseGlobal = std::wstring(localApp) + L"\\pnpm\\global\\v11\\";
-    std::wstring searchPattern = baseGlobal + L"*";
-
-    WIN32_FIND_DATAW fd;
-    HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    bool found = false;
-    do {
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
-            continue;
+    // 1. 优先探测 npm 全局安装路径 (%APPDATA%\npm\node_modules\@deepseek-ai\dsh\lib\bin.js)
+    if (GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH) > 0) {
+        std::wstring npmModules = std::wstring(buf) + L"\\npm\\node_modules";
+        std::wstring npmBin = npmModules + L"\\@deepseek-ai\\dsh\\lib\\bin.js";
+        if (PathFileExistsW(npmBin.c_str())) {
+            outBinJs = npmBin;
+            outNodePath = npmModules;
+            return true;
         }
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            std::wstring candBin = baseGlobal + fd.cFileName + L"\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js";
-            std::wstring candNodePath = baseGlobal + fd.cFileName + L"\\node_modules\\.pnpm\\node_modules";
+    }
 
-            if (PathFileExistsW(candBin.c_str())) {
-                outBinJs = candBin;
-                outNodePath = candNodePath;
-                found = true;
-                break;
-            }
+    // 2. 探测 pnpm 全局安装路径 (%LOCALAPPDATA%\pnpm\global\*)
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH) > 0) {
+        std::wstring baseGlobal = std::wstring(buf) + L"\\pnpm\\global\\";
+        std::wstring searchPattern = baseGlobal + L"*";
+
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
+                    continue;
+                }
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    // 检查直接位于版本目录下，或版本目录的下级哈希目录
+                    std::wstring versionDir = baseGlobal + fd.cFileName;
+                    std::wstring candBin = versionDir + L"\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js";
+                    std::wstring candNodePath = versionDir + L"\\node_modules\\.pnpm\\node_modules";
+
+                    if (PathFileExistsW(candBin.c_str())) {
+                        outBinJs = candBin;
+                        outNodePath = candNodePath;
+                        FindClose(hFind);
+                        return true;
+                    }
+
+                    // 探测 global/<ver>/<hash>/... 结构
+                    std::wstring subPattern = versionDir + L"\\*";
+                    WIN32_FIND_DATAW subFd;
+                    HANDLE hSubFind = FindFirstFileW(subPattern.c_str(), &subFd);
+                    if (hSubFind != INVALID_HANDLE_VALUE) {
+                        do {
+                            if (subFd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                                if (wcscmp(subFd.cFileName, L".") == 0 || wcscmp(subFd.cFileName, L"..") == 0) continue;
+                                std::wstring hashDir = versionDir + L"\\" + subFd.cFileName;
+                                std::wstring subCandBin = hashDir + L"\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js";
+                                std::wstring subCandNodePath = hashDir + L"\\node_modules\\.pnpm\\node_modules";
+                                if (PathFileExistsW(subCandBin.c_str())) {
+                                    outBinJs = subCandBin;
+                                    outNodePath = subCandNodePath;
+                                    FindClose(hSubFind);
+                                    FindClose(hFind);
+                                    return true;
+                                }
+                            }
+                        } while (FindNextFileW(hSubFind, &subFd));
+                        FindClose(hSubFind);
+                    }
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
         }
-    } while (FindNextFileW(hFind, &fd));
+    }
 
-    FindClose(hFind);
-    return found;
+    // 3. 探测 yarn 全局安装路径 (%LOCALAPPDATA%\Yarn\Data\global\node_modules\@deepseek-ai\dsh\lib\bin.js)
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH) > 0) {
+        std::wstring yarnModules = std::wstring(buf) + L"\\Yarn\\Data\\global\\node_modules";
+        std::wstring yarnBin = yarnModules + L"\\@deepseek-ai\\dsh\\lib\\bin.js";
+        if (PathFileExistsW(yarnBin.c_str())) {
+            outBinJs = yarnBin;
+            outNodePath = yarnModules;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool LaunchBackendProcess(const std::wstring& workingDir, PROCESS_INFORMATION& pi) {
@@ -484,6 +549,7 @@ bool LaunchBackendProcess(const std::wstring& workingDir, PROCESS_INFORMATION& p
 
     DWORD creationFlags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
 
+    // 阶段 1：直通 Node.js 极速启动 (npm / pnpm / yarn 全局安装探测)
     std::wstring nodeExe, binJs, nodePath;
     if (ResolveDshDirectPaths(nodeExe, binJs, nodePath)) {
         LogMessage("INFO", "成功动态定位到 DSH 运行文件 (启用 Direct Node.js 极速直通启动)");
@@ -507,31 +573,47 @@ bool LaunchBackendProcess(const std::wstring& workingDir, PROCESS_INFORMATION& p
             &pi
         );
 
-        if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
-        if (success) return true;
-        LogMessage("WARN", "Direct Node.js 启动失败，正在回退至 pwsh 启动");
+        if (success) {
+            if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+            return true;
+        }
+        LogMessage("WARN", "Direct Node.js 启动失败，正在回退至系统 Shell 启动");
     }
 
-    // 回退方案：通过 pwsh 执行
-    std::wstring cmdLine = L"pwsh.exe -ExecutionPolicy Bypass -Command \"dsh web --no-open\"";
-    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
-    cmdBuf.push_back(L'\0');
+    // 阶段 2：多级 Shell 级联回退 (pwsh -> powershell -> cmd)
+    const std::vector<std::pair<std::string, std::wstring>> fallbackCommands = {
+        {"pwsh (PowerShell 7)", L"pwsh.exe -ExecutionPolicy Bypass -Command \"dsh web --no-open\""},
+        {"powershell (Windows PowerShell)", L"powershell.exe -ExecutionPolicy Bypass -Command \"dsh web --no-open\""},
+        {"cmd (Windows Command Prompt)", L"cmd.exe /d /c \"dsh web --no-open\""}
+    };
 
-    BOOL success = CreateProcessW(
-        NULL,
-        cmdBuf.data(),
-        NULL,
-        NULL,
-        TRUE,
-        creationFlags,
-        NULL,
-        workingDir.c_str(),
-        &si,
-        &pi
-    );
+    for (const auto& entry : fallbackCommands) {
+        std::wstring cmdLine = entry.second;
+        std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+        cmdBuf.push_back(L'\0');
+
+        BOOL success = CreateProcessW(
+            NULL,
+            cmdBuf.data(),
+            NULL,
+            NULL,
+            TRUE,
+            creationFlags,
+            NULL,
+            workingDir.c_str(),
+            &si,
+            &pi
+        );
+
+        if (success) {
+            LogMessage("INFO", "通过回退解释器 " + entry.first + " 成功创建后台进程");
+            if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+            return true;
+        }
+    }
 
     if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
-    return (success == TRUE);
+    return false;
 }
 
 bool WaitForPortReady(const char* host, unsigned short port, DWORD timeoutMs, HANDLE hProcess) {
