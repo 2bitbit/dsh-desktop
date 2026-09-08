@@ -1,12 +1,15 @@
 # dsh-desktop
 
 <p align="center">
-  <b>Lightweight, zero-overhead native Windows lifecycle shim & launcher for DeepSeek Harness (<code>@deepseek-ai/dsh</code>) PWA.</b><br>
+  <b>Native Windows desktop launcher for DeepSeek Harness (<code>@deepseek-ai/dsh</code>)</b><br>
+  One shortcut = run <code>dsh web --no-open</code> in a chosen directory, parse this process's token, open a maximized Edge app window, and tear everything down when the window closes.
+  <br><br>
   <a href="https://github.com/2bitbit/dsh-desktop/releases/latest"><img src="https://img.shields.io/github/v/release/2bitbit/dsh-desktop?color=blue&label=Release" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/Platform-Windows%20Only%20(10%2F11%20x64)-blue" alt="Platform">
+  <img src="https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-blue" alt="Platform">
+  <img src="https://img.shields.io/badge/Requires-dsh%20%3E%3D%200.1.2-informational" alt="Requires dsh">
   <br>
-  <a href="README.md">简体中文版本</a>
+  <a href="README.md">简体中文</a>
 </p>
 
 <p align="center">
@@ -14,65 +17,107 @@
 </p>
 
 > [!IMPORTANT]
-> **Platform Notice**: This project relies heavily on Win32 GUI, Windows Job Object, and WinEventHook kernel mechanisms. It is **Windows-only (Windows 10 / 11 x64)**.
+> **Windows 10 / 11 x64 only.** Uses Win32 GUI, Job Object, WinEventHook, and a local Microsoft Edge install.
+>
+> You do **not** need to "Install app / PWA" in Edge first. v2 launches `msedge.exe --app=<tokenUrl>` directly.
 
 ---
 
-## Highlights
+## What it does
 
-- **Zero Console Clutter**: Native Win32 GUI entrypoint with `NUL` IO redirection—no black terminal windows.
-- **Strict Process Supervision**: Windows Job Object binding ensures all `node.exe` processes terminate when the PWA closes—**zero zombie processes, instant port 3080 release**.
-- **Direct Node.js Bypass**: Auto-detects global `npm` / `pnpm` / `yarn` modules to bypass shell startup latency (cascades to `pwsh` → `powershell` → `cmd` if needed).
-- **0% CPU Idle**: Win32 `SetWinEventHook` + `MsgWaitForMultipleObjects` sleep until the window closes—**zero polling, zero CPU overhead**.
+From dsh 0.1.2 the web root is authenticated: each process prints a one-shot URL with `?token=`. The browser exchanges that token for a session cookie, then lands on a clean root. Opening `http://127.0.0.1:3080/` with no token returns 401.
+
+This repo folds that flow into a console-less exe:
+
+1. Show a native splash immediately (cancellable).
+2. Launch `dsh web --no-open` through pnpm's `node.exe`, stdout on a pipe.
+3. Parse `dsh web: http://127.0.0.1:<port>/?token=...`.
+4. Open Edge `--app=<tokenUrl>` once, then maximize it.
+5. Window close → Job Object kills the node tree and frees the port.
 
 ---
 
-## Quick Start
+## Quick start
 
 ### 1. Prerequisites
-- Global DSH: `npm i -g @deepseek-ai/dsh` or `pnpm add -g @deepseek-ai/dsh`
-- Edge PWA: Open `http://127.0.0.1:3080/` in Edge and click "Install App" in the address bar.
 
-### 2. Create Shortcuts
-Download and extract the [Latest Release](https://github.com/2bitbit/dsh-desktop/releases/latest), then run in PowerShell:
+- Windows 10 / 11 x64 with Microsoft Edge
+- Global dsh **≥ 0.1.2**: `pnpm add -g @deepseek-ai/dsh`
+
+No Edge PWA install required.
+
+### 2. Create shortcuts
+
+Download the [latest release zip](https://github.com/2bitbit/dsh-desktop/releases/latest), extract it, then in PowerShell:
 
 ```powershell
-# Interactive Mode: pops up a folder picker to choose your workspace
+# Interactive: folder picker
 .\install_shortcut.ps1
 
-# CLI Mode: specify the target directory directly
+# Explicit workspace
 .\install_shortcut.ps1 -TargetDirectory "D:\Your\Workspace"
 ```
-> 💡 **Usage**: Generates dedicated shortcuts on both your **Desktop and Start Menu**. Clicking the shortcut is **completely equivalent to running `dsh web --no-open` in that directory and automatically launching/managing the Edge PWA window**.
+
+Shortcuts land on both **Desktop and Start Menu**. Clicking one is equivalent to running `dsh web --no-open` in that directory, then opening a maximized Edge app window with the process token.
 
 ---
 
-## Architecture
+## Lifecycle
 
 ```
-Shortcut (--cwd <dir>) ──> dsh_pwa_shim.exe ──(Job Object)──> Node.js (dsh web)
-                                │
-                                ├─ 30ms TCP probe on port 3080
-                                ├─ Launch Edge PWA & capture HWND/PID
-                                └─ Sleep (0% CPU) ──[Close Window]──> Instant Job tree teardown
+Shortcut (--cwd <dir>)
+        │
+        ▼
+dsh_pwa_shim.exe ── splash
+        │
+        ├─ Job Object ──▶ node (dsh web --no-open)
+        │                     │
+        │                     └─ stdout: dsh web: http://127.0.0.1:<port>/?token=***
+        │
+        ├─ Edge --app=<tokenUrl>  (maximized)
+        │
+        └─ close window ──▶ TerminateJobObject ──▶ reclaim process tree / free port
 ```
+
+While running it sleeps on `SetWinEventHook` + `MsgWaitForMultipleObjects` — **zero polling, 0% CPU**.
 
 ---
 
-## CLI Options
+## CLI
 
 | Option | Description | Example |
 | :--- | :--- | :--- |
-| `--cwd <path>` / `-w <path>` | Set DSH working directory (equivalent to running `dsh web` inside it) | `dsh_pwa_shim.exe --cwd "D:\Projects\Demo"` |
-| `--debug` / `-d` | Enable debug logging & dialogs | `dsh_pwa_shim.exe --debug` |
+| `--cwd <path>` / `-w <path>` | dsh working directory | `dsh_pwa_shim.exe --cwd "D:\Projects\Demo"` |
+| `--debug` / `-d` | debug log + error dialogs | `dsh_pwa_shim.exe --debug` |
+
+Two log files next to the exe (truncated on each launch, appended while running, size-capped; tokens redacted):
+
+| File | Contents | Cap |
+| :--- | :--- | :--- |
+| `dsh_pwa_shim.log` | shim log | 512 KB |
+| `dsh_web_console.log` | `dsh web` stdout/stderr | 2 MB |
 
 ---
 
-## Build from Source
+## Changes since v1.0
+
+- **No preinstalled Edge PWA**, no hardcoded `--app-id`.
+- **No TCP probe on port 3080.** Parses the authenticated URL this process printed (port may vary).
+- Native splash: the browser does not open until the token exists, so no 401 flash.
+- Captured window is maximized.
+- `dsh web` console output is written to `dsh_web_console.log`.
+
+---
+
+## Build from source
+
+Needs one of MinGW-w64 / LLVM Clang / MSVC:
 
 ```powershell
 .\scripts\build.ps1
 ```
+
+Output: `bin/dsh_pwa_shim.exe`.
 
 ---
 

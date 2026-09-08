@@ -1,9 +1,11 @@
 <#
 .SYNOPSIS
-    Create or update Windows Shortcuts for DSH PWA Shim.
+    为 DSH Desktop Shim 创建或更新 Windows 快捷方式。
 .DESCRIPTION
-    Creates a shortcut in the Start Menu and/or Desktop pointing to dsh_pwa_shim.exe.
-    The created shortcut is equivalent to running "dsh web --no-open" in the specified target directory.
+    在开始菜单和/或桌面创建指向 dsh_pwa_shim.exe 的快捷方式。
+    点击快捷方式等效于在指定工作目录执行 `dsh web --no-open`，
+    并由 shim 解析本次进程的认证 URL 后拉起 Edge --app 窗口。
+    无需预先安装 Edge PWA。
 #>
 
 [CmdletBinding()]
@@ -20,15 +22,14 @@ $ErrorActionPreference = "Stop"
 $scriptDir = $PSScriptRoot
 $rootDir = (Get-Item $scriptDir).Parent.FullName
 
-# 1. Resolve target working directory (CLI arg -> Interactive Folder Picker -> Fallback $HOME)
 if (-not $PSBoundParameters.ContainsKey('TargetDirectory') -or [string]::IsNullOrWhiteSpace($TargetDirectory)) {
     if (-not $NonInteractive) {
         Add-Type -AssemblyName System.Windows.Forms
         $folderDialog = New-Object System.Windows.Forms.FolderBrowserDialog
-        $folderDialog.Description = "请选择工作目录 (快捷方式将等效于在此目录下执行 'dsh web --no-open'):"
+        $folderDialog.Description = "请选择工作目录（快捷方式将等效于在此目录执行 'dsh web --no-open'）:"
         $folderDialog.ShowNewFolderButton = $true
         $folderDialog.SelectedPath = (Get-Location).Path
-        
+
         $dialogResult = $folderDialog.ShowDialog()
         if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullOrWhiteSpace($folderDialog.SelectedPath)) {
             $TargetDirectory = $folderDialog.SelectedPath
@@ -40,24 +41,21 @@ if (-not $PSBoundParameters.ContainsKey('TargetDirectory') -or [string]::IsNullO
     }
 }
 
-# Resolve full absolute path
 $TargetDirectory = (Resolve-Path $TargetDirectory).Path
 
-# 2. Resolve shortcut name
 if (-not $PSBoundParameters.ContainsKey('ShortcutName') -or [string]::IsNullOrWhiteSpace($ShortcutName)) {
     $folderLeaf = Split-Path $TargetDirectory -Leaf
     if ($folderLeaf -and $TargetDirectory -ne $HOME) {
         $ShortcutName = "DSH ($folderLeaf)"
     } else {
-        $ShortcutName = "DSH (Silent PWA)"
+        $ShortcutName = "DeepSeek Harness"
     }
 }
 
-# 3. Locate executable
 if (-not $ExePath) {
     $siblingExe = Join-Path $scriptDir "dsh_pwa_shim.exe"
     $repoBinExe = Join-Path $rootDir "bin\dsh_pwa_shim.exe"
-    
+
     if (Test-Path $siblingExe) {
         $ExePath = $siblingExe
     } elseif (Test-Path $repoBinExe) {
@@ -65,22 +63,22 @@ if (-not $ExePath) {
     } else {
         $buildScript = Join-Path $scriptDir "build.ps1"
         if (Test-Path $buildScript) {
-            Write-Host "Executable not found. Running build.ps1 first..." -ForegroundColor Yellow
+            Write-Host "未找到可执行文件，正在先运行 build.ps1 ..." -ForegroundColor Yellow
             & $buildScript
             $ExePath = $repoBinExe
         } else {
-            Write-Error "Could not find dsh_pwa_shim.exe in $scriptDir or $rootDir\bin"
+            Write-Error "未在 $scriptDir 或 $rootDir\bin 找到 dsh_pwa_shim.exe"
             exit 1
         }
     }
 }
 
-$WshShell = New-Object -ComObject WScript.Shell
+if (-not (Test-Path $ExePath)) {
+    Write-Error "目标程序不存在: $ExePath"
+    exit 1
+}
 
-# 4. Attempt to locate DeepSeek Harness PWA Icon
-$pwaAppId = "hgiemfgfjhalibdoboikeiepnnjapnpc"
-$edgeIconPattern = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\Default\Web Applications\_crx__$pwaAppId\*.ico"
-$pwaIcon = Get-ChildItem -Path $edgeIconPattern -ErrorAction SilentlyContinue | Select-Object -First 1
+$WshShell = New-Object -ComObject WScript.Shell
 
 $destinations = @()
 if ($Location -in @("StartMenu", "Both")) {
@@ -96,7 +94,7 @@ Write-Host "============================================================" -Foreg
 Write-Host " 创建 DSH 桌面快捷方式" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host " [工作目录] : $TargetDirectory" -ForegroundColor White
-Write-Host " [等效命令] : 在该目录下执行 'dsh web --no-open' 并静默联动 PWA" -ForegroundColor Green
+Write-Host " [等效命令] : 在该目录执行 'dsh web --no-open'，解析 token 后拉起 Edge --app" -ForegroundColor Green
 Write-Host " [目标程序] : $ExePath" -ForegroundColor DarkGray
 Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
 
@@ -105,14 +103,8 @@ foreach ($dest in $destinations) {
     $shortcut.TargetPath = $ExePath
     $shortcut.Arguments = "--cwd `"$TargetDirectory`""
     $shortcut.WorkingDirectory = $TargetDirectory
-    $shortcut.Description = "Equivalent to running 'dsh web --no-open' in '$TargetDirectory' with silent PWA lifecycle management."
-    
-    if ($pwaIcon) {
-        $shortcut.IconLocation = "$($pwaIcon.FullName),0"
-    } else {
-        $shortcut.IconLocation = "$ExePath,0"
-    }
-    
+    $shortcut.Description = "Equivalent to running 'dsh web --no-open' in '$TargetDirectory', then opening Edge --app with the process token URL."
+    $shortcut.IconLocation = "$ExePath,0"
     $shortcut.Save()
     Write-Host "[OK] 已生成快捷方式: $dest" -ForegroundColor Green
 }
