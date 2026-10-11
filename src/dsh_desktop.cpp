@@ -142,6 +142,7 @@ namespace GlobalState {
     static bool g_CloseInterceptReady = false;
     static bool g_TrayAdded = false;
     static HICON g_TrayIcon = NULL;
+    static HWINEVENTHOOK g_DestroyHook = NULL;   // 窗口销毁钩子（托盘重启换窗口时会重挂）
     static UINT g_SystemDpi = 96;
     static PFN_GetDpiForWindow g_GetDpiForWindow = NULL;
 
@@ -1317,7 +1318,43 @@ bool RestartBackend() {
     }
     LogMessage("INFO", "已捕获新认证 URL: " + RedactToken(url));
 
-    // 5) 接管新后台
+    // 5) 换应用窗口：用新 token 重开一个，再把旧窗口关掉。
+    //    托盘重启不会让页面整页重载，而"只重连"会踩到插件的冷投影竞态（重启后弹一串通知），
+    //    也让前端停在旧代码上；换一个全新窗口就与 dshmarket 那次整页重载等价了。
+    HWND oldWindow = GlobalState::g_TargetHwnd;
+    bool keepHidden = (oldWindow != NULL && IsWindow(oldWindow) && !IsWindowVisible(oldWindow));
+    std::vector<HWND> oldWindows = SnapshotExistingAppWindows();
+
+    if (LaunchAppWithAuthUrl(FromUtf8(url))) {
+        DWORD newPid = 0;
+        HWND newWindow = CaptureAppWindowWithPid(oldWindows, Config::APP_CAPTURE_TIMEOUT_MS, newPid, hStdoutRead, acc);
+        if (newWindow != NULL) {
+            // 先把监控目标切到新窗口，再关旧的：旧窗口此刻已不是监控目标，
+            // 它的销毁事件既不会命中 g_TargetHwnd，挂钩也已换到新 PID。
+            GlobalState::g_TargetHwnd = newWindow;
+            GlobalState::g_TargetPid = newPid;
+            GlobalState::g_AppClosed = false;
+            InstallWindowDestroyHook(newWindow, newPid);
+            LogMessage("INFO", "已锁定新的应用窗口 HWND: " + std::to_string(reinterpret_cast<uintptr_t>(newWindow))
+                               + ", PID: " + std::to_string(newPid));
+            if (keepHidden) {
+                ShowWindow(newWindow, SW_HIDE);
+                LogMessage("INFO", "旧窗口当时收在托盘里，新窗口沿用该状态，不打扰你");
+            } else {
+                MaximizeAppWindow(newWindow);
+            }
+            if (oldWindow != NULL && IsWindow(oldWindow)) {
+                PostMessageW(oldWindow, WM_CLOSE, 0, 0);
+                LogMessage("INFO", "已关闭旧应用窗口");
+            }
+        } else {
+            LogMessage("WARN", "没能捕获到新的应用窗口，保留旧窗口（页面会自动重连；必要时按 Ctrl+R）");
+        }
+    } else {
+        LogMessage("WARN", "没能唤起新的应用窗口，保留旧窗口（页面会自动重连；必要时按 Ctrl+R）");
+    }
+
+    // 6) 接管新后台
     GlobalState::g_Job = job;
     GlobalState::g_BackendProcess = pi.hProcess;
     int newPort = ParseUrlPort(url);
@@ -1328,7 +1365,7 @@ bool RestartBackend() {
     }
     StartConsoleDrainThread(hStdoutRead);
     GlobalState::g_Restarting = false;
-    LogMessage("INFO", "后台已重启并就绪；页面会自动重连并同步插件图（若界面没起色，按 Ctrl+R 整页刷新）");
+    LogMessage("INFO", "后台已重启并就绪，应用窗口已换成新页面");
     return true;
 }
 
@@ -1967,6 +2004,11 @@ static VOID CALLBACK WinEventProcCallback(
 }
 
 HWINEVENTHOOK InstallWindowDestroyHook(HWND targetHwnd, DWORD targetPid) {
+    // 托盘重启会换窗口：先注销上一个钩子，免得旧窗口的销毁事件被当成「用户关掉了程序」
+    if (GlobalState::g_DestroyHook != NULL) {
+        UnhookWinEvent(GlobalState::g_DestroyHook);
+        GlobalState::g_DestroyHook = NULL;
+    }
     GlobalState::g_TargetHwnd = targetHwnd;
     GlobalState::g_TargetPid = targetPid;
 
@@ -1993,6 +2035,7 @@ HWINEVENTHOOK InstallWindowDestroyHook(HWND targetHwnd, DWORD targetPid) {
     } else {
         LogMessage("INFO", "WinEventHook 注册成功 (EVENT_OBJECT_DESTROY)");
     }
+    GlobalState::g_DestroyHook = hHook;
     return hHook;
 }
 
@@ -2021,13 +2064,16 @@ void StartConsoleDrainThread(HANDLE hStdoutRead) {
 }
 
 void RunEventDrivenLifecyclePump(HWND targetHwnd, DWORD targetPid) {
-    HWINEVENTHOOK hHook = InstallWindowDestroyHook(targetHwnd, targetPid);
+    InstallWindowDestroyHook(targetHwnd, targetPid);
 
     LogMessage("INFO", "进入 MsgWaitForMultipleObjects 内核挂起等待 (0 轮询 / 0% CPU) ...");
 
     if (targetHwnd != NULL && !IsWindow(targetHwnd)) {
         LogMessage("INFO", "挂钩时检测到目标窗口已无效，立即退出");
-        if (hHook) UnhookWinEvent(hHook);
+        if (GlobalState::g_DestroyHook != NULL) {
+            UnhookWinEvent(GlobalState::g_DestroyHook);
+            GlobalState::g_DestroyHook = NULL;
+        }
         return;
     }
 
@@ -2074,8 +2120,9 @@ void RunEventDrivenLifecyclePump(HWND targetHwnd, DWORD targetPid) {
         }
     }
 
-    if (hHook) {
-        UnhookWinEvent(hHook);
+    if (GlobalState::g_DestroyHook != NULL) {
+        UnhookWinEvent(GlobalState::g_DestroyHook);
+        GlobalState::g_DestroyHook = NULL;
         LogMessage("INFO", "已注销 WinEventHook");
     }
 }
