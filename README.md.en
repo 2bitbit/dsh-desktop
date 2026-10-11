@@ -2,11 +2,11 @@
 
 <p align="center">
   <b>Native Windows desktop launcher for DeepSeek Harness (<code>@deepseek-ai/dsh</code>)</b><br>
-  One shortcut = run <code>dsh web --no-open</code> in a chosen directory, parse this process's token, open a maximized Edge app window, and tear everything down when the window closes.
+  One shortcut = run <code>dsh web --no-open</code> in a chosen directory, parse this process's token, open a maximized Edge app window, and keep it in the tray until you quit from the tray menu.
   <br><br>
   <a href="https://github.com/2bitbit/dsh-desktop/releases/latest"><img src="https://img.shields.io/github/v/release/2bitbit/dsh-desktop?color=blue&label=Release" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-blue" alt="Platform">
+  <img src="https://img.shields.io/badge/Platform-Windows%2010%201607%2B%20%2F%2011%20x64-blue" alt="Platform">
   <img src="https://img.shields.io/badge/Requires-dsh%20%3E%3D%200.1.2-informational" alt="Requires dsh">
   <br>
   <a href="README.md">简体中文</a>
@@ -17,9 +17,11 @@
 </p>
 
 > [!IMPORTANT]
-> **Windows 10 / 11 x64 only.** Uses Win32 GUI, Job Object, WinEventHook, and a local Microsoft Edge install.
+> **Windows 10 1607+ / 11 x64 only.** Uses Win32 GUI, Job Object, WinEventHook, low-level input hooks, per-monitor DPI awareness v2, and a local Microsoft Edge install.
 >
-> You do **not** need to "Install app / PWA" in Edge first. v2 launches `msedge.exe --app=<tokenUrl>` directly.
+> You do **not** need to "Install app / PWA" in Edge first. This version launches `msedge.exe --app=<tokenUrl>` directly.
+>
+> "App window" here means Chromium's app-mode window, which has nothing to do with an installed PWA (that was the v1 approach).
 
 ---
 
@@ -29,11 +31,31 @@ From dsh 0.1.2 the web root is authenticated: each process prints a one-shot URL
 
 This repo folds that flow into a console-less exe:
 
-1. Show a native splash immediately (cancellable).
-2. Launch `dsh web --no-open` through pnpm's `node.exe`, stdout on a pipe.
-3. Parse `dsh web: http://127.0.0.1:<port>/?token=...`.
-4. Open Edge `--app=<tokenUrl>` once, then maximize it.
-5. Window close → Job Object kills the node tree and frees the port.
+1. Single-instance check: if an instance is already running, just bring its window to the front and exit.
+2. Show a native splash immediately (cancellable).
+3. Launch `dsh web --no-open` through pnpm's `node.exe`, stdout on a pipe.
+4. Parse `dsh web: http://127.0.0.1:<port>/?token=...`.
+5. Open Edge `--app=<tokenUrl>` once, maximize it, then publish a tray icon.
+6. Closing the window (X / Alt+F4 / Ctrl+Shift+W) only **hides it to the tray**; the backend keeps running.
+7. Tray menu → Quit → Job Object kills the node tree and frees the port.
+
+---
+
+## Close semantics
+
+| Action | Result |
+| :--- | :--- |
+| Left-click the title-bar X | Hide to tray, backend keeps running |
+| `Alt+F4` (app window focused) | Same |
+| `Ctrl+Shift+W` (app window focused) | Same |
+| Left-click the tray icon / run the exe again | Bring the existing window to the front |
+| Right-click tray icon → Show window | Same |
+| Right-click tray icon → Quit and stop backend | Close window + kill process tree + remove tray icon + exit |
+| Window destroyed by anything else (taskbar preview close, browser crash, …) | Reclaim the backend and exit too — no zombie processes |
+
+None of the three "hide to tray" paths shows any notification, and none of them stops the backend.
+
+Hotkeys are intercepted only while the **app window is focused**, so they never steal `Alt+F4` / `Ctrl+Shift+W` from other programs.
 
 ---
 
@@ -41,7 +63,7 @@ This repo folds that flow into a console-less exe:
 
 ### 1. Prerequisites
 
-- Windows 10 / 11 x64 with Microsoft Edge
+- Windows 10 1607+ / 11 x64 with Microsoft Edge
 - Global dsh **≥ 0.1.2**: `pnpm add -g @deepseek-ai/dsh`
 
 No Edge PWA install required.
@@ -60,6 +82,8 @@ Download the [latest release zip](https://github.com/2bitbit/dsh-desktop/release
 
 Shortcuts land on both **Desktop and Start Menu**. Clicking one is equivalent to running `dsh web --no-open` in that directory, then opening a maximized Edge app window with the process token.
 
+The tray icon comes from the exe's embedded resource (`src/tray_icon.ico`); the shortcut icon uses the same one.
+
 ---
 
 ## Lifecycle
@@ -68,7 +92,9 @@ Shortcuts land on both **Desktop and Start Menu**. Clicking one is equivalent to
 Shortcut (--cwd <dir>)
         │
         ▼
-dsh_pwa_shim.exe ── splash
+dsh_pwa_shim.exe ── single-instance check (already running → focus it, exit)
+        │
+        ├─ splash
         │
         ├─ Job Object ──▶ node (dsh web --no-open)
         │                     │
@@ -76,10 +102,16 @@ dsh_pwa_shim.exe ── splash
         │
         ├─ Edge --app=<tokenUrl>  (maximized)
         │
-        └─ close window ──▶ TerminateJobObject ──▶ reclaim process tree / free port
+        ├─ tray icon published
+        │
+        ├─ X / Alt+F4 / Ctrl+Shift+W ──▶ hide to tray (backend keeps running)
+        │
+        └─ tray menu "Quit" ──▶ TerminateJobObject ──▶ reclaim process tree / free port
 ```
 
 While running it sleeps on `SetWinEventHook` + `MsgWaitForMultipleObjects` — **zero polling, 0% CPU**.
+
+How the X gets intercepted: the shim installs a `WH_MOUSE_LL` low-level mouse hook. On left-button-down inside the window's top band it asks the app window for `WM_NCHITTEST`; Chromium answers truthfully for its self-drawn title bar, returning `HTCLOSE` for the close button. Only a `HTCLOSE` hit swallows the click and hides the window — normal clicks inside the page are untouched.
 
 ---
 
@@ -106,18 +138,25 @@ Two log files next to the exe (truncated on each launch, appended while running,
 - Native splash: the browser does not open until the token exists, so no 401 flash.
 - Captured window is maximized.
 - `dsh web` console output is written to `dsh_web_console.log`.
+- Tray residency + close semantics (X / Alt+F4 / Ctrl+Shift+W hide to tray; the tray menu really quits).
+- Single instance: running the exe again only focuses the existing window.
+- The tray icon is embedded in the exe; no external icon file needed.
 
 ---
 
 ## Build from source
 
-Needs one of MinGW-w64 / LLVM Clang / MSVC:
+Needs one of MinGW-w64 / LLVM Clang / MSVC, plus the matching resource compiler (`windres` or `rc.exe`):
 
 ```powershell
 .\scripts\build.ps1
 ```
 
-Output: `bin/dsh_pwa_shim.exe`.
+The script first compiles `src/dsh_pwa_shim.rc` (which embeds the tray icon `src/tray_icon.ico`) into a resource object, then links it together with `src/dsh_pwa_shim.cpp`.
+
+Output: `bin/dsh_pwa_shim.exe`. The GCC path links with `-static -static-libgcc -static-libstdc++`, so the binary does not depend on MinGW runtime DLLs.
+
+> The GCC path is tested on MinGW-w64 GCC 15; the Clang and MSVC paths are untested.
 
 ---
 
