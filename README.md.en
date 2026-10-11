@@ -36,10 +36,11 @@ This repo folds that flow into a console-less exe:
 5. Open Edge `--app=<tokenUrl>` once, maximize it, then publish a tray icon.
 6. Closing the window (X / Alt+F4 / Ctrl+Shift+W) only **hides it to the tray**; the backend keeps running.
 7. Tray menu → Quit → Job Object kills the node tree and frees the port.
+8. Tray menu → Restart → the backend comes back up in place (window and tray stay put); dshmarket's own Restart works too.
 
 ---
 
-## Close semantics
+## Close and restart
 
 | Action | Result |
 | :--- | :--- |
@@ -48,12 +49,26 @@ This repo folds that flow into a console-less exe:
 | `Ctrl+Shift+W` (app window focused) | Same |
 | Left-click the tray icon / run the exe again | Bring the existing window to the front |
 | Right-click tray icon → Show window | Same |
+| **Right-click tray icon → Restart backend** | **Reclaim and relaunch the backend; window and tray icon stay put** |
+| **Run the exe again with `--restart`** | **Same as the tray item (handy for a shortcut)** |
+| Restart from dshmarket | Backend restarts, the page reconnects on its own (the launcher no longer kills the restart helper) |
 | Right-click tray icon → Quit and stop backend | Close window + kill process tree + remove tray icon + exit |
 | Window destroyed by anything else (taskbar preview close, browser crash, …) | Reclaim the backend and exit too — no zombie processes |
 
 None of the three "hide to tray" paths shows any notification, and none of them stops the backend.
 
 Hotkeys are intercepted only while the **app window is focused**, so they never steal `Alt+F4` / `Ctrl+Shift+W` from other programs.
+
+### How restart works
+
+When the backend's main process exits, the launcher does **not** reclaim immediately. It enters a "restart watch window" (30 s by default):
+
+1. the port is being listened on again → treat it as a successful restart, adopt the new process and keep supervising; tray icon and window stay put;
+2. no process left in the job, or the watch window expires → treat it as a real exit and reclaim everything.
+
+The signal is the **port**, not the main process handle, because dshmarket restarts by having the main process kill itself and letting a **detached helper** bring a replacement up once the port is free. That helper is still inside the launcher's Job Object (measured), so watching the main process handle used to kill the helper and its replacement too — which is exactly why "click Restart" used to leave the tray icon gone and the page spinning.
+
+The app window does **not** need to be reopened: the page reloads itself when it sees the boot id change.
 
 ---
 
@@ -102,6 +117,11 @@ dsh_desktop.exe ── single-instance check (already running → focus it, exit
         │
         ├─ X / Alt+F4 / Ctrl+Shift+W ──▶ hide to tray (backend keeps running)
         │
+        ├─ tray "Restart" / --restart / dshmarket's Restart
+        │        └─▶ restart watch window: wait for the port to be listened on again
+        │               ├─ it is back ──▶ adopt the new process (tray and window stay put)
+        │               └─ nothing came back / job empty ──▶ treat as a real exit
+        │
         └─ tray menu "Quit" ──▶ TerminateJobObject ──▶ reclaim process tree / free port
 ```
 
@@ -117,6 +137,7 @@ How the X gets intercepted: the launcher installs a `WH_MOUSE_LL` low-level mous
 | :--- | :--- | :--- |
 | `--cwd <path>` / `-w <path>` | dsh working directory | `dsh_desktop.exe --cwd "D:\Projects\Demo"` |
 | `--debug` / `-d` | debug log + error dialogs | `dsh_desktop.exe --debug` |
+| `--restart` | Ask the running instance to restart the backend (same as the tray item) | `dsh_desktop.exe --restart` |
 
 Two log files next to the exe (truncated on each launch, appended while running, size-capped; tokens redacted):
 
