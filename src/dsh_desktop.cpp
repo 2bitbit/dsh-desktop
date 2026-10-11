@@ -17,8 +17,12 @@
  *     - 右键托盘菜单「退出」→ 关闭应用窗口并回收后台进程树；
  *     - 窗口被其它途径销毁（任务栏预览关闭、浏览器崩溃等）→ 同样回收后台再退出，不留僵尸进程。
  * 11. 托盘图标：左键单击前置窗口；右键弹出菜单；图标内嵌自 IDI_DSH_TRAY 资源；Explorer 重启后自动重建。
- * 12. 进程按「每显示器 DPI 感知 v2」运行：低层钩子给物理坐标，DPI 不感知会让关闭按钮判定差一个缩放比。
- * 13. 每次启动清空 exe 同级 dsh_desktop.log / dsh_web_console.log；运行中追加，分别 512KB / 2MB 防爆。token 入日志时脱敏。
+ * 12. 重启支持：后台主进程退出后先进「重启观察窗」（等端口重新被监听），而不是立即回收。
+ *     这样 dshmarket 的「重启」（主进程自杀 + 脱离进程的助手拉起替补）能活下来；
+ *     观察窗内若发现作业里已无存活进程、或超时，才按真正结束处理。
+ *     托盘菜单另有「重启后台」，由本程序自己完成回收与重启（不依赖 dshmarket 的助手）。
+ * 13. 进程按「每显示器 DPI 感知 v2」运行：低层钩子给物理坐标，DPI 不感知会让关闭按钮判定差一个缩放比。
+ * 14. 每次启动清空 exe 同级 dsh_desktop.log / dsh_web_console.log；运行中追加，分别 512KB / 2MB 防爆。token 入日志时脱敏。
  *
  * 构建：
  *   1) 托盘图标是内嵌资源：图标 src/tray_icon.ico，资源脚本 src/dsh_desktop.rc
@@ -28,7 +32,7 @@
  *        windres -c 65001 src/dsh_desktop.rc -O coff -o bin/dsh_desktop.res
  *        g++ -O2 -std=c++17 -municode -mwindows -static -static-libgcc -static-libstdc++ \
  *            src/dsh_desktop.cpp bin/dsh_desktop.res -o bin/dsh_desktop.exe \
- *            -lshlwapi -lshell32 -lole32 -luser32 -lgdi32
+ *            -lshlwapi -lshell32 -lole32 -luser32 -lgdi32 -liphlpapi -lws2_32
  */
 
 #ifndef UNICODE
@@ -43,6 +47,8 @@
 #include <objbase.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <winsock2.h>     // ntohs：TCP 表里的本地端口是网络字节序
+#include <iphlpapi.h>     // GetExtendedTcpTable：查端口现在归谁监听
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -94,7 +100,12 @@ namespace Config {
     constexpr UINT WM_DSH_HIDDEN              = WM_APP + 3;   // 刚刚隐藏到托盘（只记日志，不弹任何通知）
     constexpr UINT TRAY_ICON_ID               = 1;
     constexpr UINT TRAY_MENU_SHOW             = 1;
-    constexpr UINT TRAY_MENU_QUIT             = 2;
+    constexpr UINT TRAY_MENU_RESTART          = 2;
+    constexpr UINT TRAY_MENU_QUIT             = 3;
+    constexpr UINT WM_DSH_RESTART             = WM_APP + 4;   // 第二个实例带 --restart 时请求重启后台
+    constexpr DWORD RESTART_WATCH_MS          = 30000;        // 后台主进程退出后，等它被拉回来的观察窗
+    constexpr DWORD RESTART_POLL_INTERVAL_MS  = 300;          // 观察窗内的探测间隔
+    constexpr DWORD PORT_RELEASE_WAIT_MS      = 3000;         // 托盘重启前，等旧后台让出端口
     constexpr int  IDI_DSH_TRAY               = 101;          // 必须与 dsh_desktop.rc 中的 ID 一致
     constexpr DWORD HIDE_HOTKEY_VK            = 'W';          // Ctrl+Shift+W：等价于左键点叉号
     constexpr int  CAPTION_BAND_LOGICAL_PX    = 120;          // 只在窗口顶部这条带内做关闭按钮判定
@@ -133,6 +144,13 @@ namespace GlobalState {
     static HICON g_TrayIcon = NULL;
     static UINT g_SystemDpi = 96;
     static PFN_GetDpiForWindow g_GetDpiForWindow = NULL;
+
+    // ---- 后台与重启：句柄会随重启更换，所以放全局，而不是当函数参数传来传去 ----
+    static HANDLE g_Job = NULL;              // 当前作业对象
+    static HANDLE g_BackendProcess = NULL;   // 当前后台主进程句柄
+    static std::wstring g_WorkingDir;        // 重启时复用的工作目录
+    static int g_ServerPort = 0;             // 从认证 URL 解析出的端口
+    static bool g_Restarting = false;        // 重启进行中，防重入
 }
 
 // ==========================================
@@ -208,10 +226,11 @@ std::wstring FromUtf8(const std::string& str);
 std::string RedactToken(const std::string& text);
 
 /**
- * @brief 单实例判定：若已有实例在跑，把前台特权转交给它并请它前置窗口。
+ * @brief 单实例判定：若已有实例在跑，把前台特权转交给它并请它前置窗口（或重启后台）。
+ * @param restartRequested true 表示本次是「让已有实例重启后台」，而不是前置窗口。
  * @return true 表示已有实例接管，本进程应立即退出。
  */
-bool ActivateExistingInstance();
+bool ActivateExistingInstance(bool restartRequested);
 
 /**
  * @brief 创建隐藏控制窗：单实例锚点 + 托盘回调 + 跨实例消息宿主。
@@ -291,6 +310,37 @@ void ShowTrayMenu();
  * @brief 托盘菜单「退出」：关闭应用窗口并让主循环走回收路径。
  */
 void RequestQuit();
+
+/**
+ * @brief 从认证 URL 里取出端口号。
+ * @param url 形如 http://127.0.0.1:<port>/?token=...
+ * @return 端口号；解析不出来返回 0。
+ */
+int ParseUrlPort(const std::string& url);
+
+/**
+ * @brief 查现在是谁在监听这个端口。
+ * @param port 端口号。
+ * @return 监听进程 PID；没人监听返回 0。
+ */
+DWORD FindPortListenerPid(int port);
+
+/**
+ * @brief 重启观察窗：后台主进程退出后，等它被（dshmarket 的脱离进程助手）拉回来。
+ *
+ * 判据是「端口重新有人监听」而不是「主进程句柄」——重启期间作业里始终有助手/替补活着，
+ * 所以绝不能一看到主进程退出就回收。
+ * @param port 期望重新被监听的端口。
+ * @param timeoutMs 观察窗时长。
+ * @return 新后台的进程句柄；没能重启则返回 NULL。
+ */
+HANDLE WaitForBackendRestart(int port, DWORD timeoutMs);
+
+/**
+ * @brief 托盘菜单「重启后台」：回收当前后台并原样重启，窗口与托盘图标保持不动。
+ * @return 是否重启成功。
+ */
+bool RestartBackend();
 
 /**
  * @brief 添加托盘图标（图标取自内嵌资源 IDI_DSH_TRAY）。
@@ -403,12 +453,11 @@ HWND CaptureAppWindowWithPid(const std::vector<HWND>& oldHwnds, DWORD timeoutMs,
 void MaximizeAppWindow(HWND hwnd);
 
 /**
- * @brief 纯事件驱动的主监控事件泵。
+ * @brief 纯事件驱动的主监控事件泵（后台与重启句柄走全局状态，重启后自动改用新句柄）。
  * @param targetHwnd 目标应用窗口句柄。
  * @param targetPid 目标应用进程 PID。
- * @param hBackendProcess 后台服务进程句柄。
  */
-void RunEventDrivenLifecyclePump(HWND targetHwnd, DWORD targetPid, HANDLE hBackendProcess);
+void RunEventDrivenLifecyclePump(HWND targetHwnd, DWORD targetPid);
 
 /**
  * @brief 启动阻塞读线程，把剩余 stdout/stderr 写入 dsh_web_console.log。
@@ -442,6 +491,19 @@ void TruncateLog();
  */
 bool IsDebugMode(LPCWSTR lpCmdLine);
 
+/**
+ * @brief 命令行里是否出现了某个独立参数（按空格分词，避免子串误判）。
+ * @param lpCmdLine 宽字符命令行字符串。
+ * @param flag 参数原文，例如 L"--restart"。
+ * @return 是否出现。
+ */
+bool HasCommandLineFlag(LPCWSTR lpCmdLine, const wchar_t* flag);
+
+/**
+ * @brief 抽空并派发当前线程的消息队列（不阻塞）。
+ */
+static void PumpPendingMessages();
+
 // ==========================================
 // 报纸结构：主流程入口 (wWinMain)
 // ==========================================
@@ -467,7 +529,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     }
 
     // 前提检查 2：单实例。必须早于 TruncateLog，否则会把正在运行实例的日志清空。
-    if (ActivateExistingInstance()) {
+    // 带 --restart 时，已有实例收到的不是「前置窗口」而是「重启后台」。
+    if (ActivateExistingInstance(HasCommandLineFlag(lpCmdLine, L"--restart"))) {
         CoUninitialize();
         return 0;
     }
@@ -556,6 +619,12 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         return GlobalState::g_SplashCancelled ? 0 : 4;
     }
     LogMessage("INFO", "已捕获认证 URL: " + RedactToken(authUrlUtf8));
+    GlobalState::g_Job = hJob;
+    GlobalState::g_BackendProcess = pi.hProcess;
+    GlobalState::g_WorkingDir = workingDir;
+    GlobalState::g_ServerPort = ParseUrlPort(authUrlUtf8);
+    LogMessage("INFO", "后台端口: " + std::to_string(GlobalState::g_ServerPort)
+                       + "（重启观察窗与端口探测都用它）");
 
     std::vector<HWND> oldHwnds = SnapshotExistingAppWindows();
     LogMessage("INFO", "启动前匹配窗口快照数量: " + std::to_string(oldHwnds.size()));
@@ -595,12 +664,15 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     DestroySplashWindow();
     StartConsoleDrainThread(hStdoutRead);
     hStdoutRead = NULL;
-    RunEventDrivenLifecyclePump(targetHwnd, targetPid, pi.hProcess);
+    RunEventDrivenLifecyclePump(targetHwnd, targetPid);
 
     LogMessage("INFO", "窗口已销毁，正在强制清理后台进程树 ...");
     RemoveTrayIcon();
     UninstallCloseInterceptors();
-    CleanupBackendProcess(hJob, pi.hProcess, hStdoutRead);
+    CleanupBackendProcess(GlobalState::g_Job, GlobalState::g_BackendProcess, hStdoutRead);
+    GlobalState::g_Job = NULL;
+    GlobalState::g_BackendProcess = NULL;
+    GlobalState::g_Restarting = false;
     CoUninitialize();
     LogMessage("INFO", "========== DSH Desktop 正常退出 (后台已完全回收) ==========");
 
@@ -802,11 +874,23 @@ bool IsDebugMode(LPCWSTR lpCmdLine) {
     return false;
 }
 
+bool HasCommandLineFlag(LPCWSTR lpCmdLine, const wchar_t* flag) {
+    if (lpCmdLine == NULL || flag == NULL) return false;
+    size_t length = wcslen(flag);
+    const wchar_t* p = lpCmdLine;
+    while (*p != 0) {
+        while (*p == L' ') ++p;
+        if (wcsncmp(p, flag, length) == 0 && (p[length] == 0 || p[length] == L' ')) return true;
+        while (*p != 0 && *p != L' ') ++p;
+    }
+    return false;
+}
+
 // ==========================================
-// 单实例：控制窗与第二个实例的前置请求
+// 单实例：控制窗与第二个实例的前置/重启请求
 // ==========================================
 
-bool ActivateExistingInstance() {
+bool ActivateExistingInstance(bool restartRequested) {
     HWND existing = FindWindowW(Config::CONTROLLER_CLASS, Config::CONTROLLER_TITLE);
     if (existing == NULL) {
         return false;
@@ -815,17 +899,20 @@ bool ActivateExistingInstance() {
     DWORD pid = 0;
     GetWindowThreadProcessId(existing, &pid);
     BOOL granted = AllowSetForegroundWindow(pid);
-    if (!PostMessageW(existing, Config::WM_DSH_ACTIVATE, 0, 0)) {
+    UINT request = restartRequested ? Config::WM_DSH_RESTART : Config::WM_DSH_ACTIVATE;
+    if (!PostMessageW(existing, request, 0, 0)) {
         DWORD err = GetLastError();
-        LogMessage("ERROR", "发现已有实例 (PID " + std::to_string(pid) + ") 但前置消息投递失败，LastError: " + std::to_string(err));
+        LogMessage("ERROR", "发现已有实例 (PID " + std::to_string(pid) + ") 但消息投递失败，LastError: " + std::to_string(err));
         MessageBoxW(NULL,
-                    L"DSH 已在运行，但本次无法把它的窗口前置（消息投递失败）。\n"
-                    L"请手动切换到已有窗口，或在托盘菜单里退出后重试。",
+                    restartRequested
+                        ? L"DSH 已在运行，但本次无法请它重启后台（消息投递失败）。\n请改用托盘菜单里的「重启后台」。"
+                        : L"DSH 已在运行，但本次无法把它的窗口前置（消息投递失败）。\n请手动切换到已有窗口，或在托盘菜单里退出后重试。",
                     L"DSH Desktop", MB_ICONWARNING);
         return true;
     }
-    LogMessage("INFO", "检测到已有实例 (PID " + std::to_string(pid) + ")，已请求它前置窗口；本次进程直接退出"
-                       "（前台特权转交: " + std::string(granted ? "成功" : "失败") + "）");
+    LogMessage("INFO", "检测到已有实例 (PID " + std::to_string(pid) + ")，已请求它"
+                       + (restartRequested ? "重启后台" : "前置窗口")
+                       + "；本次进程直接退出（前台特权转交: " + std::string(granted ? "成功" : "失败") + "）");
     return true;
 }
 
@@ -870,6 +957,10 @@ LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case Config::WM_DSH_ACTIVATE:
             LogMessage("INFO", "收到第二个实例的前置请求");
             ActivateMainWindow();
+            return 0;
+        case Config::WM_DSH_RESTART:
+            LogMessage("INFO", "收到第二个实例的重启请求（--restart）");
+            RestartBackend();
             return 0;
         case Config::WM_DSH_HIDDEN:
             LogMessage("INFO", "应用窗口已隐藏到托盘，后台继续运行（重新显示：左键托盘图标或再运行一次 exe）");
@@ -1048,6 +1139,9 @@ void ShowTrayMenu() {
         return;
     }
     AppendMenuW(menu, MF_STRING, Config::TRAY_MENU_SHOW, L"显示窗口(&S)");
+    AppendMenuW(menu, MF_STRING,
+                Config::TRAY_MENU_RESTART | (GlobalState::g_Restarting ? MF_GRAYED : 0),
+                L"重启后台(&R)");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, Config::TRAY_MENU_QUIT, L"退出并结束后台(&X)");
     SetMenuDefaultItem(menu, Config::TRAY_MENU_SHOW, FALSE);
@@ -1062,6 +1156,8 @@ void ShowTrayMenu() {
 
     if (cmd == Config::TRAY_MENU_SHOW) {
         ActivateMainWindow();
+    } else if (cmd == Config::TRAY_MENU_RESTART) {
+        RestartBackend();
     } else if (cmd == Config::TRAY_MENU_QUIT) {
         RequestQuit();
     }
@@ -1074,6 +1170,166 @@ void RequestQuit() {
         PostMessageW(app, WM_CLOSE, 0, 0);
     }
     PostQuitMessage(0);   // 不依赖窗口是否响应，回收路径固定走主循环出口
+}
+
+int ParseUrlPort(const std::string& url) {
+    size_t scheme = url.find("://");
+    size_t host = (scheme == std::string::npos) ? 0 : scheme + 3;
+    size_t colon = url.find(':', host);
+    if (colon == std::string::npos) {
+        return 0;
+    }
+    size_t end = url.find_first_of("/?", colon + 1);
+    if (end == std::string::npos) {
+        end = url.size();
+    }
+    int port = 0;
+    for (size_t i = colon + 1; i < end; ++i) {
+        if (url[i] < '0' || url[i] > '9') {
+            return 0;
+        }
+        port = port * 10 + (url[i] - '0');
+    }
+    return (port > 0 && port < 65536) ? port : 0;
+}
+
+DWORD FindPortListenerPid(int port) {
+    DWORD size = 0;
+    if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != ERROR_INSUFFICIENT_BUFFER) {
+        return 0;
+    }
+    std::vector<BYTE> buffer(size);
+    if (GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != NO_ERROR) {
+        return 0;
+    }
+    auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buffer.data());
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        if (ntohs(static_cast<u_short>(table->table[i].dwLocalPort)) == static_cast<u_short>(port)) {
+            return table->table[i].dwOwningPid;
+        }
+    }
+    return 0;
+}
+
+HANDLE WaitForBackendRestart(int port, DWORD timeoutMs) {
+    if (port <= 0) {
+        LogMessage("WARN", "没有可用端口（认证 URL 未解析出端口），无法判断后台是否回来");
+        return NULL;
+    }
+
+    DWORD startTick = GetTickCount();
+    LogMessage("INFO", "重启观察窗开始：等端口 " + std::to_string(port) + " 重新被监听（最多 "
+                       + std::to_string(timeoutMs / 1000) + " 秒）");
+
+    while ((GetTickCount() - startTick) < timeoutMs) {
+        PumpPendingMessages();
+        if (GlobalState::g_AppClosed) {
+            LogMessage("INFO", "观察窗内收到退出请求，不再等待");
+            return NULL;
+        }
+
+        DWORD pid = FindPortListenerPid(port);
+        if (pid != 0) {
+            HANDLE handle = OpenProcess(SYNCHRONIZE, FALSE, pid);
+            if (handle != NULL) {
+                LogMessage("INFO", "端口 " + std::to_string(port) + " 已恢复监听（新后台 PID "
+                                   + std::to_string(pid) + "），重启成功");
+                return handle;
+            }
+            // 端口刚恢复但进程打不开，通常是查询与打开之间的竞态：继续等下一轮
+            LogMessage("WARN", "端口已恢复但进程句柄打不开，继续观察，LastError: " + std::to_string(GetLastError()));
+        }
+
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+        ZeroMemory(&accounting, sizeof(accounting));
+        if (QueryInformationJobObject(GlobalState::g_Job, JobObjectBasicAccountingInformation,
+                                      &accounting, sizeof(accounting), NULL)
+            && accounting.ActiveProcesses == 0) {
+            LogMessage("INFO", "作业内已无存活进程：没有人在重启，按真正结束处理");
+            return NULL;
+        }
+
+        Sleep(Config::RESTART_POLL_INTERVAL_MS);
+    }
+
+    LogMessage("WARN", "重启观察窗超时，按真正结束处理");
+    return NULL;
+}
+
+bool RestartBackend() {
+    if (GlobalState::g_Restarting) {
+        LogMessage("INFO", "已有重启在进行中，忽略本次请求");
+        return false;
+    }
+    GlobalState::g_Restarting = true;
+    LogMessage("INFO", "开始重启后台：回收当前进程树，再用同一工作目录重新拉起（窗口与托盘保持不动）");
+
+    // 1) 回收当前后台（旧管道读线程会随管道 EOF 自行退出）
+    if (GlobalState::g_Job != NULL) {
+        TerminateJobObject(GlobalState::g_Job, 0);
+        CloseHandle(GlobalState::g_Job);
+        GlobalState::g_Job = NULL;
+    }
+    if (GlobalState::g_BackendProcess != NULL) {
+        CloseHandle(GlobalState::g_BackendProcess);
+        GlobalState::g_BackendProcess = NULL;
+    }
+    if (GlobalState::g_DrainThread != NULL) {
+        WaitForSingleObject(GlobalState::g_DrainThread, 1000);
+        CloseHandle(GlobalState::g_DrainThread);
+        GlobalState::g_DrainThread = NULL;
+    }
+
+    // 2) 等旧后台让出端口，否则新后台会撞 EADDRINUSE
+    DWORD releaseStart = GetTickCount();
+    while (FindPortListenerPid(GlobalState::g_ServerPort) != 0
+           && (GetTickCount() - releaseStart) < Config::PORT_RELEASE_WAIT_MS) {
+        PumpPendingMessages();
+        Sleep(100);
+    }
+
+    // 3) 新作业 + 原样重启
+    HANDLE job = InitializeJobObject();
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+    HANDLE hStdoutRead = NULL;
+    if (job == NULL || !LaunchBackendProcess(GlobalState::g_WorkingDir, pi, hStdoutRead)) {
+        LogMessage("ERROR", "重启失败：后台进程未能创建，LastError: " + std::to_string(GetLastError()));
+        if (job != NULL) CloseHandle(job);
+        GlobalState::g_Restarting = false;
+        PostQuitMessage(0);   // 没有后台可管了，按退出处理（窗口保留，用户可重新启动）
+        return false;
+    }
+    AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    LogMessage("INFO", "后台进程已重新创建 (PID: " + std::to_string(pi.dwProcessId) + ")");
+
+    // 4) 等新的认证 URL（静默等待，不弹启动窗）
+    std::string acc;
+    std::string url;
+    if (!WaitForAuthUrl(hStdoutRead, pi.hProcess, NULL, Config::AUTH_URL_TIMEOUT_MS, acc, url)) {
+        LogMessage("ERROR", "重启失败：没等到新的认证 URL，程序将退出；请重新启动（窗口可以关掉了）");
+        CleanupBackendProcess(job, pi.hProcess, hStdoutRead);
+        GlobalState::g_Restarting = false;
+        PostQuitMessage(0);
+        return false;
+    }
+    LogMessage("INFO", "已捕获新认证 URL: " + RedactToken(url));
+
+    // 5) 接管新后台
+    GlobalState::g_Job = job;
+    GlobalState::g_BackendProcess = pi.hProcess;
+    int newPort = ParseUrlPort(url);
+    if (newPort != GlobalState::g_ServerPort) {
+        LogMessage("WARN", "端口变了：" + std::to_string(GlobalState::g_ServerPort) + " → " + std::to_string(newPort)
+                           + "，页面需按新地址重开（请在窗口里按 Ctrl+R，或用新快捷方式重开）");
+        GlobalState::g_ServerPort = newPort;
+    }
+    StartConsoleDrainThread(hStdoutRead);
+    GlobalState::g_Restarting = false;
+    LogMessage("INFO", "后台已重启并就绪；页面会在检测到 boot 变化后自行重载");
+    return true;
 }
 
 bool AddTrayIcon() {
@@ -1764,7 +2020,7 @@ void StartConsoleDrainThread(HANDLE hStdoutRead) {
     GlobalState::g_DrainThread = thread;
 }
 
-void RunEventDrivenLifecyclePump(HWND targetHwnd, DWORD targetPid, HANDLE hBackendProcess) {
+void RunEventDrivenLifecyclePump(HWND targetHwnd, DWORD targetPid) {
     HWINEVENTHOOK hHook = InstallWindowDestroyHook(targetHwnd, targetPid);
 
     LogMessage("INFO", "进入 MsgWaitForMultipleObjects 内核挂起等待 (0 轮询 / 0% CPU) ...");
@@ -1777,16 +2033,31 @@ void RunEventDrivenLifecyclePump(HWND targetHwnd, DWORD targetPid, HANDLE hBacke
 
     bool running = true;
     while (running && !GlobalState::g_AppClosed) {
+        if (GlobalState::g_BackendProcess == NULL) {
+            LogMessage("WARN", "后台进程句柄为空，无法继续监督");
+            break;
+        }
+
         DWORD waitRes = MsgWaitForMultipleObjects(
             1,
-            &hBackendProcess,
+            &GlobalState::g_BackendProcess,
             FALSE,
             INFINITE,
             QS_ALLINPUT
         );
 
         if (waitRes == WAIT_OBJECT_0) {
-            LogMessage("WARN", "后台服务进程句柄被置位，服务已终止");
+            // 主进程退出了，但这不等于"服务结束"：dshmarket 的重启就是主进程自杀，
+            // 由脱离进程的助手把替补拉起来，助手与替补都还在我们的作业里。
+            LogMessage("INFO", "后台主进程已退出：先看作业里还有没有人（区分「重启中」与「真结束」）");
+            HANDLE restarted = WaitForBackendRestart(GlobalState::g_ServerPort, Config::RESTART_WATCH_MS);
+            if (restarted != NULL) {
+                CloseHandle(GlobalState::g_BackendProcess);
+                GlobalState::g_BackendProcess = restarted;
+                LogMessage("INFO", "继续监督新的后台进程；托盘图标与窗口保持不动");
+                continue;
+            }
+            LogMessage("WARN", "后台没有回来，按真正结束处理");
             running = false;
         } else if (waitRes == WAIT_OBJECT_0 + 1) {
             MSG msg;

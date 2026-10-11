@@ -64,7 +64,7 @@ if (-not (Test-CommandAvailable $resourceCompiler)) {
 
 Write-Host "==> 使用 $resolved 编译 dsh_desktop ..." -ForegroundColor Cyan
 
-$libs = @("-lshlwapi", "-lshell32", "-lole32", "-luser32", "-lgdi32")
+$libs = @("-lshlwapi", "-lshell32", "-lole32", "-luser32", "-lgdi32", "-liphlpapi", "-lws2_32")
 $optFlags = if ($DebugBuild) { @("-g", "-O0") } else { @("-O3", "-s") }
 
 # ---------- 1. 资源：内嵌托盘图标 ----------
@@ -143,7 +143,9 @@ switch ($resolved) {
             "shell32.lib",
             "ole32.lib",
             "user32.lib",
-            "gdi32.lib"
+            "gdi32.lib",
+            "iphlpapi.lib",
+            "ws2_32.lib"
         )
 
         Write-Host "Command: cl.exe $($compileArgs -join ' ')" -ForegroundColor DarkGray
