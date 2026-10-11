@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    编译 DSH Desktop Shim（C++ Win32 GUI）。
+    编译 DSH Desktop（C++ Win32 GUI 启动器）。
 .DESCRIPTION
-    1) 先用 windres / rc.exe 把 src/dsh_pwa_shim.rc（内嵌托盘图标 src/tray_icon.ico）编译成资源对象。
-    2) 再把 src/dsh_pwa_shim.cpp 与资源一起编译为 bin/dsh_pwa_shim.exe。
+    1) 先用 windres / rc.exe 把 src/dsh_desktop.rc（内嵌托盘图标 src/tray_icon.ico）编译成资源对象。
+    2) 再把 src/dsh_desktop.cpp 与资源一起编译为 bin/dsh_desktop.exe。
     支持 GCC、Clang、MSVC；入口为 wWinMain，需 Unicode / 无控制台子系统。
     已在 MinGW-w64 GCC 15 上实测；Clang / MSVC 两条路径未实测。
 #>
@@ -18,14 +18,14 @@ param(
 $ErrorActionPreference = "Stop"
 $rootDir = (Get-Item $PSScriptRoot).Parent.FullName
 $srcDir = Join-Path $rootDir "src"
-$srcFile = Join-Path $srcDir "dsh_pwa_shim.cpp"
-$rcFile = Join-Path $srcDir "dsh_pwa_shim.rc"
+$srcFile = Join-Path $srcDir "dsh_desktop.cpp"
+$rcFile = Join-Path $srcDir "dsh_desktop.rc"
 $icoFile = Join-Path $srcDir "tray_icon.ico"
 $binDir = Join-Path $rootDir "bin"
-$outFile = Join-Path $binDir "dsh_pwa_shim.exe"
-$resFile = Join-Path $binDir "dsh_pwa_shim.res"
+$outFile = Join-Path $binDir "dsh_desktop.exe"
+$resFile = Join-Path $binDir "dsh_desktop.res"
 
-# 托盘图标是关闭语义的一部分：资源缺失时 shim 会在运行期禁用「叉号收进托盘」，
+# 托盘图标是关闭语义的一部分：资源缺失时启动器会在运行期禁用「叉号收进托盘」，
 # 所以这里缺输入就直接失败，不留「编出来能跑但少功能」的产物。
 foreach ($required in @($srcFile, $rcFile, $icoFile)) {
     if (-not (Test-Path $required)) {
@@ -62,7 +62,7 @@ if (-not (Test-CommandAvailable $resourceCompiler)) {
     exit 1
 }
 
-Write-Host "==> 使用 $resolved 编译 dsh_pwa_shim ..." -ForegroundColor Cyan
+Write-Host "==> 使用 $resolved 编译 dsh_desktop ..." -ForegroundColor Cyan
 
 $libs = @("-lshlwapi", "-lshell32", "-lole32", "-luser32", "-lgdi32")
 $optFlags = if ($DebugBuild) { @("-g", "-O0") } else { @("-O3", "-s") }

@@ -1,13 +1,13 @@
-/* dsh_pwa_shim.rc —— 只做一件事：把托盘图标内嵌进 exe。
+/* dsh_desktop.rc —— 只做一件事：把托盘图标内嵌进 exe。
  *
- * 构建：windres -c 65001 src/dsh_pwa_shim.rc -O coff -o bin/dsh_pwa_shim.res
+ * 构建：windres -c 65001 src/dsh_desktop.rc -O coff -o bin/dsh_desktop.res
  * 也可以直接跑 scripts/build.ps1（它会自动处理这一步）。
  * 图标 tray_icon.ico 与本文件同目录，是多尺寸 ico（16/20/24/32/40/48/64/256）——
  * 托盘图标在不同 DPI 下会取不同尺寸，单尺寸 256 直接缩到 16 会糊。
  *
  * 注意：IDI_DSH_TRAY 必须在这里 #define 成数字。windres 遇到未定义标识符会把它
  * 当成「字符串资源名」写进去，那样 LoadImage(MAKEINTRESOURCE(101)) 就找不到图标
- * （实测报 LastError 1813）。该数字必须与 dsh_pwa_shim.cpp 的 Config::IDI_DSH_TRAY 一致。 */
+ * （实测报 LastError 1813）。该数字必须与 dsh_desktop.cpp 的 Config::IDI_DSH_TRAY 一致。 */
 
 #include <windows.h>
 

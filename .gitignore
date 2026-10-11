@@ -11,7 +11,7 @@
 
 # Runtime logs
 *.log
-dsh_pwa_shim.log
+dsh_desktop.log
 dsh_web_console.log
 
 # IDE & OS files

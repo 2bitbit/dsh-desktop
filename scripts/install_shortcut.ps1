@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    为 DSH Desktop Shim 创建或更新 Windows 快捷方式。
+    为 DSH Desktop 创建或更新 Windows 快捷方式。
 .DESCRIPTION
-    在开始菜单和/或桌面创建指向 dsh_pwa_shim.exe 的快捷方式。
+    在开始菜单和/或桌面创建指向 dsh_desktop.exe 的快捷方式。
     点击快捷方式等效于在指定工作目录执行 `dsh web --no-open`，
-    并由 shim 解析本次进程的认证 URL 后拉起 Edge --app 窗口。
-    无需预先安装 Edge PWA。
+    并由启动器解析本次进程的认证 URL 后拉起 Edge 应用窗口。
+    不需要在 Edge 里预先安装任何应用。
 #>
 
 [CmdletBinding()]
@@ -53,8 +53,8 @@ if (-not $PSBoundParameters.ContainsKey('ShortcutName') -or [string]::IsNullOrWh
 }
 
 if (-not $ExePath) {
-    $siblingExe = Join-Path $scriptDir "dsh_pwa_shim.exe"
-    $repoBinExe = Join-Path $rootDir "bin\dsh_pwa_shim.exe"
+    $siblingExe = Join-Path $scriptDir "dsh_desktop.exe"
+    $repoBinExe = Join-Path $rootDir "bin\dsh_desktop.exe"
 
     if (Test-Path $siblingExe) {
         $ExePath = $siblingExe
@@ -67,7 +67,7 @@ if (-not $ExePath) {
             & $buildScript
             $ExePath = $repoBinExe
         } else {
-            Write-Error "未在 $scriptDir 或 $rootDir\bin 找到 dsh_pwa_shim.exe"
+            Write-Error "未在 $scriptDir 或 $rootDir\bin 找到 dsh_desktop.exe"
             exit 1
         }
     }
@@ -94,7 +94,7 @@ Write-Host "============================================================" -Foreg
 Write-Host " 创建 DSH 桌面快捷方式" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host " [工作目录] : $TargetDirectory" -ForegroundColor White
-Write-Host " [等效命令] : 在该目录执行 'dsh web --no-open'，解析 token 后拉起 Edge --app" -ForegroundColor Green
+Write-Host " [等效命令] : 在该目录执行 'dsh web --no-open'，解析 token 后拉起 Edge 应用窗口" -ForegroundColor Green
 Write-Host " [目标程序] : $ExePath" -ForegroundColor DarkGray
 Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
 
@@ -103,7 +103,7 @@ foreach ($dest in $destinations) {
     $shortcut.TargetPath = $ExePath
     $shortcut.Arguments = "--cwd `"$TargetDirectory`""
     $shortcut.WorkingDirectory = $TargetDirectory
-    $shortcut.Description = "Equivalent to running 'dsh web --no-open' in '$TargetDirectory', then opening Edge --app with the process token URL."
+    $shortcut.Description = "Equivalent to running 'dsh web --no-open' in '$TargetDirectory', then opening an Edge app window with the process token URL."
     $shortcut.IconLocation = "$ExePath,0"
     $shortcut.Save()
     Write-Host "[OK] 已生成快捷方式: $dest" -ForegroundColor Green

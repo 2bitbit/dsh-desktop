@@ -1,6 +1,6 @@
 /**
- * @file dsh_pwa_shim.cpp
- * @brief DSH Web 静默守护与生命周期联动 Shim（快捷方式参数驱动 + 直通 Node + 托盘常驻）
+ * @file dsh_desktop.cpp
+ * @brief DSH Desktop —— DeepSeek Harness 的 Windows 桌面启动器（快捷方式参数驱动 + 直通 Node + 托盘常驻）
  *
  * 功能职责：
  * 1. 后台工作目录由快捷方式参数 (--cwd <dir>) 提供，0 硬编码。
@@ -18,16 +18,16 @@
  *     - 窗口被其它途径销毁（任务栏预览关闭、浏览器崩溃等）→ 同样回收后台再退出，不留僵尸进程。
  * 11. 托盘图标：左键单击前置窗口；右键弹出菜单；图标内嵌自 IDI_DSH_TRAY 资源；Explorer 重启后自动重建。
  * 12. 进程按「每显示器 DPI 感知 v2」运行：低层钩子给物理坐标，DPI 不感知会让关闭按钮判定差一个缩放比。
- * 13. 每次启动清空 exe 同级 dsh_pwa_shim.log / dsh_web_console.log；运行中追加，分别 512KB / 2MB 防爆。token 入日志时脱敏。
+ * 13. 每次启动清空 exe 同级 dsh_desktop.log / dsh_web_console.log；运行中追加，分别 512KB / 2MB 防爆。token 入日志时脱敏。
  *
  * 构建：
- *   1) 托盘图标是内嵌资源：图标 src/tray_icon.ico，资源脚本 src/dsh_pwa_shim.rc
+ *   1) 托盘图标是内嵌资源：图标 src/tray_icon.ico，资源脚本 src/dsh_desktop.rc
  *      （其 ID 必须与 Config::IDI_DSH_TRAY 一致；windres 以 .rc 所在目录解析图标路径）。
  *   2) 直接跑 scripts/build.ps1：自动编译资源 + 自动挑 GCC / Clang / MSVC。
  *   3) 手工等价命令（MinGW-w64 GCC，静态链接，成品不依赖 MinGW 运行时 DLL）：
- *        windres -c 65001 src/dsh_pwa_shim.rc -O coff -o bin/dsh_pwa_shim.res
+ *        windres -c 65001 src/dsh_desktop.rc -O coff -o bin/dsh_desktop.res
  *        g++ -O2 -std=c++17 -municode -mwindows -static -static-libgcc -static-libstdc++ \
- *            src/dsh_pwa_shim.cpp bin/dsh_pwa_shim.res -o bin/dsh_pwa_shim.exe \
+ *            src/dsh_desktop.cpp bin/dsh_desktop.res -o bin/dsh_desktop.exe \
  *            -lshlwapi -lshell32 -lole32 -luser32 -lgdi32
  */
 
@@ -61,7 +61,7 @@
 // ==========================================
 namespace Config {
     constexpr const wchar_t* APP_WINDOW_CLASS = L"Chrome_WidgetWin_1";
-    constexpr const wchar_t* SPLASH_CLASS    = L"DshPwaShimSplash";
+    constexpr const wchar_t* SPLASH_CLASS    = L"DshDesktopSplash";
     constexpr int SPLASH_WIDTH_LOGICAL       = 440;
     constexpr int SPLASH_HEIGHT_LOGICAL      = 240;
     constexpr int SPLASH_FONT_HEIGHT_LOGICAL = 12;
@@ -70,7 +70,7 @@ namespace Config {
     constexpr const wchar_t* APP_TITLE_KW3   = L"dsh";
     constexpr const wchar_t* APP_TITLE_KW4   = L"3080";
 
-    constexpr const wchar_t* LOG_FILE_NAME   = L"dsh_pwa_shim.log";
+    constexpr const wchar_t* LOG_FILE_NAME   = L"dsh_desktop.log";
     constexpr const wchar_t* CONSOLE_LOG_FILE_NAME = L"dsh_web_console.log";
     constexpr DWORD MAX_LOG_SIZE_BYTES       = 512 * 1024;
     constexpr DWORD MAX_CONSOLE_LOG_SIZE_BYTES = 2 * 1024 * 1024;
@@ -85,8 +85,8 @@ namespace Config {
     constexpr const char* AUTH_URL_MARKER    = "dsh web: ";
 
     // ---- 单实例 / 托盘 / 关闭拦截 ----
-    constexpr const wchar_t* CONTROLLER_CLASS = L"DshPwaShimController";
-    constexpr const wchar_t* CONTROLLER_TITLE = L"DSH Desktop Shim Controller";
+    constexpr const wchar_t* CONTROLLER_CLASS = L"DshDesktopController";
+    constexpr const wchar_t* CONTROLLER_TITLE = L"DSH Desktop Controller";
     constexpr const wchar_t* TASKBAR_CREATED_MSG = L"TaskbarCreated";
     constexpr const wchar_t* TRAY_TIP         = L"DeepSeek Harness（左键显示 / 右键菜单 / Ctrl+Shift+W 收起）";
     constexpr UINT WM_DSH_ACTIVATE            = WM_APP + 1;   // 第二个实例请求前置窗口
@@ -95,7 +95,7 @@ namespace Config {
     constexpr UINT TRAY_ICON_ID               = 1;
     constexpr UINT TRAY_MENU_SHOW             = 1;
     constexpr UINT TRAY_MENU_QUIT             = 2;
-    constexpr int  IDI_DSH_TRAY               = 101;          // 必须与 dsh_pwa_shim.rc 中的 ID 一致
+    constexpr int  IDI_DSH_TRAY               = 101;          // 必须与 dsh_desktop.rc 中的 ID 一致
     constexpr DWORD HIDE_HOTKEY_VK            = 'W';          // Ctrl+Shift+W：等价于左键点叉号
     constexpr int  CAPTION_BAND_LOGICAL_PX    = 120;          // 只在窗口顶部这条带内做关闭按钮判定
     constexpr DWORD HIT_TEST_TIMEOUT_MS       = 100;
@@ -431,9 +431,9 @@ void CleanupBackendProcess(HANDLE hJob, HANDLE hProcess, HANDLE hStdoutRead);
 HANDLE OpenConsoleLog();
 
 /**
- * @brief 清空 exe 同级 dsh_pwa_shim.log，供本次启动从头写。
+ * @brief 清空 exe 同级 dsh_desktop.log，供本次启动从头写。
  */
-void TruncateShimLog();
+void TruncateLog();
 
 /**
  * @brief 检查命令行中是否含有 --debug 参数。
@@ -461,23 +461,23 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     // 前提检查 1：DPI 感知 API。缺了它，低层钩子的物理坐标与窗口矩形会差一个缩放比。
     if (!SetupDpiAwareness()) {
         MessageBoxW(NULL, L"本程序需要 Windows 10 1607 及以上（缺少 DPI 感知 API），无法保证关闭按钮判定准确。",
-                    L"DSH Shim 环境检查失败", MB_ICONERROR);
+                    L"DSH Desktop 环境检查失败", MB_ICONERROR);
         CoUninitialize();
         return 1;
     }
 
-    // 前提检查 2：单实例。必须早于 TruncateShimLog，否则会把正在运行实例的日志清空。
+    // 前提检查 2：单实例。必须早于 TruncateLog，否则会把正在运行实例的日志清空。
     if (ActivateExistingInstance()) {
         CoUninitialize();
         return 0;
     }
 
-    TruncateShimLog();
+    TruncateLog();
     GlobalState::g_ConsoleLog = OpenConsoleLog();
     if (GlobalState::g_ConsoleLog == NULL) {
         LogMessage("WARN", "无法创建 dsh_web_console.log，dsh web 输出不会落盘");
     }
-    LogMessage("INFO", "========== DSH Desktop Shim 启动 ==========");
+    LogMessage("INFO", "========== DSH Desktop 启动 ==========");
     LogMessage("INFO", "进程已开启每显示器 DPI 感知 v2，系统 DPI: " + std::to_string(GlobalState::g_SystemDpi));
     if (debug) {
         LogMessage("DEBUG", "已启用调试模式");
@@ -486,14 +486,14 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     // 前提检查 3：控制窗 + 关闭语义钩子。窗口还没起来，失败也不影响后台。
     if (CreateControllerWindow(hInstance) == NULL) {
         LogMessage("ERROR", "创建控制窗失败，LastError: " + std::to_string(GetLastError()));
-        if (debug) MessageBoxW(NULL, L"创建控制窗失败，无法保证单实例与托盘行为", L"DSH Shim 错误", MB_ICONERROR);
+        if (debug) MessageBoxW(NULL, L"创建控制窗失败，无法保证单实例与托盘行为", L"DSH Desktop 错误", MB_ICONERROR);
         CoUninitialize();
         return 6;
     }
     if (!InstallCloseInterceptors()) {
         LogMessage("ERROR", "关闭语义钩子安装失败：叉号与 Alt+F4 将直接关闭程序（托盘菜单仍可用）");
-        MessageBoxW(NULL, L"关闭语义钩子安装失败，叉号与 Alt+F4 会直接关闭程序。\n详见 exe 同级 dsh_pwa_shim.log。",
-                    L"DSH Shim 警告", MB_ICONWARNING);
+        MessageBoxW(NULL, L"关闭语义钩子安装失败，叉号与 Alt+F4 会直接关闭程序。\n详见 exe 同级 dsh_desktop.log。",
+                    L"DSH Desktop 警告", MB_ICONWARNING);
     }
 
     std::wstring workingDir = ResolveTargetWorkingDirectory();
@@ -510,7 +510,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     HANDLE hJob = InitializeJobObject();
     if (!hJob) {
         LogMessage("ERROR", "Job Object 创建或配置失败，LastError: " + std::to_string(GetLastError()));
-        if (debug) MessageBoxW(NULL, L"Job Object 创建失败", L"DSH Shim 错误", MB_ICONERROR);
+        if (debug) MessageBoxW(NULL, L"Job Object 创建失败", L"DSH Desktop 错误", MB_ICONERROR);
         DestroySplashWindow();
         CoUninitialize();
         return 2;
@@ -522,7 +522,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     HANDLE hStdoutRead = NULL;
     if (!LaunchBackendProcess(workingDir, pi, hStdoutRead)) {
         LogMessage("ERROR", "LaunchBackendProcess 启动失败，LastError: " + std::to_string(GetLastError()));
-        if (debug) MessageBoxW(NULL, L"后台 dsh web 服务启动失败，请检查 Node/dsh 安装与日志", L"DSH Shim 错误", MB_ICONERROR);
+        if (debug) MessageBoxW(NULL, L"后台 dsh web 服务启动失败，请检查 Node/dsh 安装与日志", L"DSH Desktop 错误", MB_ICONERROR);
         CloseHandle(hJob);
         DestroySplashWindow();
         CoUninitialize();
@@ -547,7 +547,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             LogMessage("INFO", "启动窗已关闭，回收后台");
         } else {
             LogMessage("ERROR", "未能在超时时间内解析到 dsh web 认证 URL");
-            if (debug) MessageBoxW(NULL, L"未能解析 dsh web 认证 URL，请查看日志", L"DSH Shim 错误", MB_ICONERROR);
+            if (debug) MessageBoxW(NULL, L"未能解析 dsh web 认证 URL，请查看日志", L"DSH Desktop 错误", MB_ICONERROR);
         }
         CleanupBackendProcess(hJob, pi.hProcess, hStdoutRead);
         DestroySplashWindow();
@@ -562,7 +562,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     SetSplashStatus(L"正在打开界面 ...");
     if (!LaunchAppWithAuthUrl(FromUtf8(authUrlUtf8))) {
         LogMessage("ERROR", "唤起 Edge --app 窗口失败");
-        if (debug) MessageBoxW(NULL, L"唤起 Edge 应用窗口失败", L"DSH Shim 错误", MB_ICONERROR);
+        if (debug) MessageBoxW(NULL, L"唤起 Edge 应用窗口失败", L"DSH Desktop 错误", MB_ICONERROR);
         CleanupBackendProcess(hJob, pi.hProcess, hStdoutRead);
         DestroySplashWindow();
         UninstallCloseInterceptors();
@@ -602,7 +602,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     UninstallCloseInterceptors();
     CleanupBackendProcess(hJob, pi.hProcess, hStdoutRead);
     CoUninitialize();
-    LogMessage("INFO", "========== DSH Desktop Shim 正常退出 (后台已完全回收) ==========");
+    LogMessage("INFO", "========== DSH Desktop 正常退出 (后台已完全回收) ==========");
 
     return 0;
 }
@@ -707,7 +707,7 @@ std::string RedactToken(const std::string& text) {
     return out;
 }
 
-void TruncateShimLog() {
+void TruncateLog() {
     HANDLE hFile = CreateFileW(
         GetLogFilePath().c_str(),
         GENERIC_WRITE,
@@ -821,7 +821,7 @@ bool ActivateExistingInstance() {
         MessageBoxW(NULL,
                     L"DSH 已在运行，但本次无法把它的窗口前置（消息投递失败）。\n"
                     L"请手动切换到已有窗口，或在托盘菜单里退出后重试。",
-                    L"DSH Shim", MB_ICONWARNING);
+                    L"DSH Desktop", MB_ICONWARNING);
         return true;
     }
     LogMessage("INFO", "检测到已有实例 (PID " + std::to_string(pid) + ")，已请求它前置窗口；本次进程直接退出"
