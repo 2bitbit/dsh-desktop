@@ -51,7 +51,7 @@ This repo folds that flow into a console-less exe:
 | Right-click tray icon → Show window | Same |
 | **Right-click tray icon → Restart backend** | **Reclaim and relaunch the backend, and swap in a fresh app window (a full refresh, new page)** |
 | **Run the exe again with `--restart`** | **Same as the tray item (handy for a shortcut)** |
-| Restart from dshmarket | Backend restarts; the window stays put and the page reloads itself (the launcher no longer kills the restart helper) |
+| Restart from dshmarket | Backend restarts **and the launcher swaps in a fresh window** using the replacement host's new token, which it reads from dshmarket's own restart log — the page is always authenticated |
 | Right-click tray icon → Quit and stop backend | Close window + kill process tree + remove tray icon + exit |
 | Window destroyed by anything else (taskbar preview close, browser crash, …) | Reclaim the backend and exit too — no zombie processes |
 
