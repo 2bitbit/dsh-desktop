@@ -19,9 +19,7 @@
 > [!IMPORTANT]
 > **仅限 Windows 10 1607+ / 11 x64**。依赖 Win32 GUI、Job Object、WinEventHook、低层输入钩子、每显示器 DPI 感知 v2，以及本机已安装的 Microsoft Edge。
 >
-> **不需要**先在 Edge 里「安装应用 / PWA」。本版用 `msedge.exe --app=<tokenUrl>` 直接开独立窗口。
->
-> 这里的「应用窗口」指 Chromium 的 app 模式窗口，与「已安装的 PWA」无关（v1 时代用的是后者）。
+> **不需要**在 Edge 里预先安装任何应用：本程序用 `msedge.exe --app=<tokenUrl>` 直接开独立窗口。
 
 ---
 
@@ -66,8 +64,6 @@
 - Windows 10 1607+ / 11 x64，已安装 Microsoft Edge
 - 已全局安装 dsh **≥ 0.1.2**：`pnpm add -g @deepseek-ai/dsh`
 
-无需安装 Edge PWA。
-
 ### 2. 安装快捷方式
 
 下载 [最新 Release 压缩包](https://github.com/2bitbit/dsh-desktop/releases/latest) 解压后，在 PowerShell 中执行：
@@ -92,7 +88,7 @@
 快捷方式 (--cwd <dir>)
         │
         ▼
-dsh_pwa_shim.exe ── 单实例检查（已有实例 → 只前置窗口，然后本进程退出）
+dsh_desktop.exe ── 单实例检查（已有实例 → 只前置窗口，然后本进程退出）
         │
         ├─ 启动窗
         │
@@ -119,28 +115,15 @@ dsh_pwa_shim.exe ── 单实例检查（已有实例 → 只前置窗口，然
 
 | 参数 | 说明 | 示例 |
 | :--- | :--- | :--- |
-| `--cwd <path>` / `-w <path>` | 后台 dsh 工作目录 | `dsh_pwa_shim.exe --cwd "D:\Projects\Demo"` |
-| `--debug` / `-d` | 调试日志 + 失败弹窗 | `dsh_pwa_shim.exe --debug` |
+| `--cwd <path>` / `-w <path>` | 后台 dsh 工作目录 | `dsh_desktop.exe --cwd "D:\Projects\Demo"` |
+| `--debug` / `-d` | 调试日志 + 失败弹窗 | `dsh_desktop.exe --debug` |
 
 exe 同级会写两份日志（每次启动清空，运行中追加并限大小；token 脱敏）：
 
 | 文件 | 内容 | 上限 |
 | :--- | :--- | :--- |
-| `dsh_pwa_shim.log` | shim 自身日志 | 512 KB |
+| `dsh_desktop.log` | 启动器自身日志 | 512 KB |
 | `dsh_web_console.log` | `dsh web` 的 stdout/stderr | 2 MB |
-
----
-
-## 相对 v1.0 的变化
-
-- **不再依赖预先安装的 Edge PWA**，也不再硬编码 `--app-id`。
-- **不再探活 3080 端口**。改为解析本次进程打印的认证 URL（端口可变）。
-- 原生启动窗：token 未就绪前不打开浏览器，避免 401。
-- 捕获窗口后自动最大化。
-- `dsh web` 控制台输出落到 `dsh_web_console.log`。
-- 托盘常驻 + 关闭语义（叉号 / Alt+F4 / Ctrl+Shift+W 收进托盘，托盘菜单真关闭）。
-- 单实例：重复运行只前置已有窗口。
-- 托盘图标内嵌进 exe，不再依赖外部图标文件。
 
 ---
 
@@ -152,11 +135,17 @@ exe 同级会写两份日志（每次启动清空，运行中追加并限大小�
 .\scripts\build.ps1
 ```
 
-脚本会先把 `src/dsh_pwa_shim.rc`（内嵌托盘图标 `src/tray_icon.ico`）编译成资源对象，再连同 `src/dsh_pwa_shim.cpp` 一起链接。
+脚本会先把 `src/dsh_desktop.rc`（内嵌托盘图标 `src/tray_icon.ico`）编译成资源对象，再连同 `src/dsh_desktop.cpp` 一起链接。
 
-产物：`bin/dsh_pwa_shim.exe`。GCC 路径用 `-static -static-libgcc -static-libstdc++` 静态链接，成品不依赖 MinGW 运行时 DLL。
+产物：`bin/dsh_desktop.exe`。GCC 路径用 `-static -static-libgcc -static-libstdc++` 静态链接，成品不依赖 MinGW 运行时 DLL。
 
 > GCC 路径已在 MinGW-w64 GCC 15 上实测；Clang / MSVC 两条路径未实测。
+
+---
+
+## 版本沿革
+
+见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 

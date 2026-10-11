@@ -1,5 +1,31 @@
 # Changelog
 
+## v2.2.0
+
+把 PWA 这个名字从项目里彻底去掉：`dsh_pwa_shim.*` → **`dsh_desktop.*`**。这是一次**破坏性改名**，且不提供任何兼容层。
+
+### 破坏性变更
+
+- 可执行文件 `dsh_pwa_shim.exe` → **`dsh_desktop.exe`**；源码与资源脚本同步改为 `src/dsh_desktop.cpp` / `src/dsh_desktop.rc`。
+- 日志文件 `dsh_pwa_shim.log` → **`dsh_desktop.log`**（`dsh_web_console.log` 不变）。
+- 窗口类名 `DshPwaShimSplash` / `DshPwaShimController` → `DshDesktopSplash` / `DshDesktopController`。
+- `scripts/build.ps1`、`scripts/install_shortcut.ps1`、两份 README、Release 资产名一并改用新名字。
+
+### 升级方式
+
+旧快捷方式指向的 `dsh_pwa_shim.exe` 已不存在，因此：
+
+1. 从托盘菜单退出正在运行的旧实例；
+2. 用新版解压目录里的 `install_shortcut.ps1` 重新创建快捷方式（或手动把快捷方式指向 `dsh_desktop.exe`）；
+3. 删除旧快捷方式与旧的 `dsh_pwa_shim.log`。
+
+本版**没有**兼容层：不保留旧文件名副本，不做旧日志路径、旧窗口类名、旧实例的回退识别。单实例锚点随类名一起变化，新旧两版互不识别——这是刻意的。
+
+### 说明
+
+- 命名依据：本版用 `msedge.exe --app=<url>` 打开的是 Chromium 的 **app 模式窗口**，与「在 Edge 里预先安装的应用 / `--app-id`」无关。v2.0.0 起行为已经如此，v2.2.0 只是把名字改到与行为一致。
+- 功能与 v2.1.0 完全相同：托盘常驻、单实例、叉号 / Alt+F4 / Ctrl+Shift+W 收进托盘、托盘菜单真关闭。
+
 ## v2.1.0
 
 托盘常驻 + 单实例 + 关闭语义重做：叉号不再是「退出」，而是收进托盘。
@@ -23,7 +49,7 @@
 ### 变更
 
 - 构建改为**静态链接**（`-static -static-libgcc -static-libstdc++`），成品不再依赖 MinGW 运行时 DLL；exe 体积由约 200 KB 变为约 500 KB（strip 后）。
-- 术语统一：受管窗口在代码里叫「应用窗口 / App」（`APP_WINDOW_CLASS`、`g_AppClosed` 等）。本版用 `msedge.exe --app=<url>` 开的是 Chromium app 模式窗口，与 v1 的「已安装 PWA」无关。文件名 `dsh_pwa_shim.*` 保持不变。
+- 术语统一：受管窗口在代码里叫「应用窗口 / App」（`APP_WINDOW_CLASS`、`g_AppClosed` 等）。
 
 ### 要求的平台
 
@@ -35,7 +61,7 @@ Windows 10 **1607+** / 11 x64（DPI 感知 v2 与低层输入钩子的下限）�
 
 ### 破坏性变更
 
-- 不再使用预先安装的 Edge PWA / `--app-id`。改为 `msedge.exe --app=<tokenUrl>`。
+- 不再使用预先安装的 Edge 应用（`--app-id`）。改为 `msedge.exe --app=<tokenUrl>` 直接开独立窗口。
 - 不再探活固定端口 `127.0.0.1:3080`。改为解析本次进程 stdout 中的 `dsh web: http://127.0.0.1:<port>/?token=...`。
 - 直通启动只认 pnpm 全局 `dsh` shim（`cmd-shim-target`），不再级联 `pwsh` / `cmd`。
 
@@ -44,8 +70,8 @@ Windows 10 **1607+** / 11 x64（DPI 感知 v2 与低层输入钩子的下限）�
 - 原生启动窗：token 未就绪前不打开浏览器，避免 401。
 - 捕获到 Edge 应用窗后自动最大化。
 - `dsh web` 的 stdout/stderr 写入 exe 同级 `dsh_web_console.log`（2 MB 防爆）。
-- shim 日志每次启动清空；token 写入日志时脱敏。
+- 日志每次启动清空；token 写入日志时脱敏。
 
 ## v1.0.0
 
-初始版本：探测 3080、唤起已安装的 Edge PWA、Job Object 生命周期联动。
+初始版本：探测 3080、唤起预先安装的 Edge 应用、Job Object 生命周期联动。

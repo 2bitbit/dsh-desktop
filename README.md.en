@@ -19,9 +19,7 @@
 > [!IMPORTANT]
 > **Windows 10 1607+ / 11 x64 only.** Uses Win32 GUI, Job Object, WinEventHook, low-level input hooks, per-monitor DPI awareness v2, and a local Microsoft Edge install.
 >
-> You do **not** need to "Install app / PWA" in Edge first. This version launches `msedge.exe --app=<tokenUrl>` directly.
->
-> "App window" here means Chromium's app-mode window, which has nothing to do with an installed PWA (that was the v1 approach).
+> You do **not** need to install anything into Edge first: this program opens a standalone window with `msedge.exe --app=<tokenUrl>`.
 
 ---
 
@@ -66,8 +64,6 @@ Hotkeys are intercepted only while the **app window is focused**, so they never 
 - Windows 10 1607+ / 11 x64 with Microsoft Edge
 - Global dsh **≥ 0.1.2**: `pnpm add -g @deepseek-ai/dsh`
 
-No Edge PWA install required.
-
 ### 2. Create shortcuts
 
 Download the [latest release zip](https://github.com/2bitbit/dsh-desktop/releases/latest), extract it, then in PowerShell:
@@ -92,7 +88,7 @@ The tray icon comes from the exe's embedded resource (`src/tray_icon.ico`); the 
 Shortcut (--cwd <dir>)
         │
         ▼
-dsh_pwa_shim.exe ── single-instance check (already running → focus it, exit)
+dsh_desktop.exe ── single-instance check (already running → focus it, exit)
         │
         ├─ splash
         │
@@ -111,7 +107,7 @@ dsh_pwa_shim.exe ── single-instance check (already running → focus it, exi
 
 While running it sleeps on `SetWinEventHook` + `MsgWaitForMultipleObjects` — **zero polling, 0% CPU**.
 
-How the X gets intercepted: the shim installs a `WH_MOUSE_LL` low-level mouse hook. On left-button-down inside the window's top band it asks the app window for `WM_NCHITTEST`; Chromium answers truthfully for its self-drawn title bar, returning `HTCLOSE` for the close button. Only a `HTCLOSE` hit swallows the click and hides the window — normal clicks inside the page are untouched.
+How the X gets intercepted: the launcher installs a `WH_MOUSE_LL` low-level mouse hook. On left-button-down inside the window's top band it asks the app window for `WM_NCHITTEST`; Chromium answers truthfully for its self-drawn title bar, returning `HTCLOSE` for the close button. Only an `HTCLOSE` hit swallows the click and hides the window — normal clicks inside the page are untouched.
 
 ---
 
@@ -119,28 +115,15 @@ How the X gets intercepted: the shim installs a `WH_MOUSE_LL` low-level mouse ho
 
 | Option | Description | Example |
 | :--- | :--- | :--- |
-| `--cwd <path>` / `-w <path>` | dsh working directory | `dsh_pwa_shim.exe --cwd "D:\Projects\Demo"` |
-| `--debug` / `-d` | debug log + error dialogs | `dsh_pwa_shim.exe --debug` |
+| `--cwd <path>` / `-w <path>` | dsh working directory | `dsh_desktop.exe --cwd "D:\Projects\Demo"` |
+| `--debug` / `-d` | debug log + error dialogs | `dsh_desktop.exe --debug` |
 
 Two log files next to the exe (truncated on each launch, appended while running, size-capped; tokens redacted):
 
 | File | Contents | Cap |
 | :--- | :--- | :--- |
-| `dsh_pwa_shim.log` | shim log | 512 KB |
+| `dsh_desktop.log` | launcher log | 512 KB |
 | `dsh_web_console.log` | `dsh web` stdout/stderr | 2 MB |
-
----
-
-## Changes since v1.0
-
-- **No preinstalled Edge PWA**, no hardcoded `--app-id`.
-- **No TCP probe on port 3080.** Parses the authenticated URL this process printed (port may vary).
-- Native splash: the browser does not open until the token exists, so no 401 flash.
-- Captured window is maximized.
-- `dsh web` console output is written to `dsh_web_console.log`.
-- Tray residency + close semantics (X / Alt+F4 / Ctrl+Shift+W hide to tray; the tray menu really quits).
-- Single instance: running the exe again only focuses the existing window.
-- The tray icon is embedded in the exe; no external icon file needed.
 
 ---
 
@@ -152,11 +135,17 @@ Needs one of MinGW-w64 / LLVM Clang / MSVC, plus the matching resource compiler 
 .\scripts\build.ps1
 ```
 
-The script first compiles `src/dsh_pwa_shim.rc` (which embeds the tray icon `src/tray_icon.ico`) into a resource object, then links it together with `src/dsh_pwa_shim.cpp`.
+The script first compiles `src/dsh_desktop.rc` (which embeds the tray icon `src/tray_icon.ico`) into a resource object, then links it together with `src/dsh_desktop.cpp`.
 
-Output: `bin/dsh_pwa_shim.exe`. The GCC path links with `-static -static-libgcc -static-libstdc++`, so the binary does not depend on MinGW runtime DLLs.
+Output: `bin/dsh_desktop.exe`. The GCC path links with `-static -static-libgcc -static-libstdc++`, so the binary does not depend on MinGW runtime DLLs.
 
 > The GCC path is tested on MinGW-w64 GCC 15; the Clang and MSVC paths are untested.
+
+---
+
+## Version history
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
