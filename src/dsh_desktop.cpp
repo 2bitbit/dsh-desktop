@@ -1328,7 +1328,7 @@ bool RestartBackend() {
     }
     StartConsoleDrainThread(hStdoutRead);
     GlobalState::g_Restarting = false;
-    LogMessage("INFO", "后台已重启并就绪；页面会在检测到 boot 变化后自行重载");
+    LogMessage("INFO", "后台已重启并就绪；页面会自动重连并同步插件图（若界面没起色，按 Ctrl+R 整页刷新）");
     return true;
 }
 
@@ -2054,7 +2054,8 @@ void RunEventDrivenLifecyclePump(HWND targetHwnd, DWORD targetPid) {
             if (restarted != NULL) {
                 CloseHandle(GlobalState::g_BackendProcess);
                 GlobalState::g_BackendProcess = restarted;
-                LogMessage("INFO", "继续监督新的后台进程；托盘图标与窗口保持不动");
+                LogMessage("INFO", "继续监督新的后台进程；托盘图标与窗口保持不动"
+                                   "（页面会自动重连，窗口不需要关）");
                 continue;
             }
             LogMessage("WARN", "后台没有回来，按真正结束处理");

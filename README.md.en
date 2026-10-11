@@ -68,7 +68,14 @@ When the backend's main process exits, the launcher does **not** reclaim immedia
 
 The signal is the **port**, not the main process handle, because dshmarket restarts by having the main process kill itself and letting a **detached helper** bring a replacement up once the port is free. That helper is still inside the launcher's Job Object (measured), so watching the main process handle used to kill the helper and its replacement too — which is exactly why "click Restart" used to leave the tray icon gone and the page spinning.
 
-The app window does **not** need to be reopened: the page reloads itself when it sees the boot id change.
+The app window does **not** need to be reopened (it stays open the whole time, tray icon included). The page side differs by who asked for the restart:
+
+| Who restarts | Backend | Page |
+| :--- | :--- | :--- |
+| dshmarket's Restart | new process | **full page reload**: its client watches the boot id (`pid-timestamp`, so it always changes) and calls `location.reload()` → frontend and backend refresh together |
+| Tray "Restart backend" / `--restart` | new process | **no full reload**: DSH's connection layer only reconnects (exponential backoff, 15 s handshake ceiling) and re-syncs the plugin graph on the new connection, so the UI comes back and plugins catch up — but the client code already in the page is not rebuilt |
+
+If the UI does not come back after a tray restart (say a bundle that cannot be fetched kept one plugin out of sync), press **Ctrl+R** in the window — it stays open, so you can refresh any time.
 
 ---
 
