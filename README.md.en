@@ -49,9 +49,9 @@ This repo folds that flow into a console-less exe:
 | `Ctrl+Shift+W` (app window focused) | Same |
 | Left-click the tray icon / run the exe again | Bring the existing window to the front |
 | Right-click tray icon → Show window | Same |
-| **Right-click tray icon → Restart backend** | **Reclaim and relaunch the backend; window and tray icon stay put** |
+| **Right-click tray icon → Restart backend** | **Reclaim and relaunch the backend, and swap in a fresh app window (a full refresh, new page)** |
 | **Run the exe again with `--restart`** | **Same as the tray item (handy for a shortcut)** |
-| Restart from dshmarket | Backend restarts, the page reconnects on its own (the launcher no longer kills the restart helper) |
+| Restart from dshmarket | Backend restarts; the window stays put and the page reloads itself (the launcher no longer kills the restart helper) |
 | Right-click tray icon → Quit and stop backend | Close window + kill process tree + remove tray icon + exit |
 | Window destroyed by anything else (taskbar preview close, browser crash, …) | Reclaim the backend and exit too — no zombie processes |
 
@@ -68,14 +68,14 @@ When the backend's main process exits, the launcher does **not** reclaim immedia
 
 The signal is the **port**, not the main process handle, because dshmarket restarts by having the main process kill itself and letting a **detached helper** bring a replacement up once the port is free. That helper is still inside the launcher's Job Object (measured), so watching the main process handle used to kill the helper and its replacement too — which is exactly why "click Restart" used to leave the tray icon gone and the page spinning.
 
-The app window does **not** need to be reopened (it stays open the whole time, tray icon included). The page side differs by who asked for the restart:
 
-| Who restarts | Backend | Page |
-| :--- | :--- | :--- |
-| dshmarket's Restart | new process | **full page reload**: its client watches the boot id (`pid-timestamp`, so it always changes) and calls `location.reload()` → frontend and backend refresh together |
-| Tray "Restart backend" / `--restart` | new process | **no full reload**: DSH's connection layer only reconnects (exponential backoff, 15 s handshake ceiling) and re-syncs the plugin graph on the new connection, so the UI comes back and plugins catch up — but the client code already in the page is not rebuilt |
+### A tray restart also swaps the app window
 
-If the UI does not come back after a tray restart (say a bundle that cannot be fetched kept one plugin out of sync), press **Ctrl+R** in the window — it stays open, so you can refresh any time.
+The tray item (and `--restart`) relaunches the backend **and** opens a fresh app window with the new token, then closes the old one. If the old window was hidden in the tray, the new one keeps that state so nothing pops up. The destroy hook is re-armed for the new window, so closing the old one is not mistaken for "the user quit".
+
+Why: backing only the backend and letting the page merely reconnect leaves the page on stale client code, and it walks into the "the host's projections are still cold" race — `dsh-notification` folds an absent projection as turn 0, so every session with a completed turn looks like it just advanced and a burst of notifications fires. A fresh window is equivalent to the full reload dshmarket does.
+
+If the UI still does not come back after a tray restart (say a bundle that cannot be fetched kept one plugin out of sync), press **Ctrl+R** in the window — it stays open, so you can refresh any time.
 
 ---
 
