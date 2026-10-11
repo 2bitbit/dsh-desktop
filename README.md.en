@@ -25,7 +25,7 @@
 
 ## What it does
 
-From dsh 0.1.2 the web root is authenticated: each process prints a one-shot URL with `?token=`. The browser exchanges that token for a session cookie, then lands on a clean root. Opening `http://127.0.0.1:3080/` with no token returns 401.
+From dsh 0.1.2 the web root is authenticated: each process prints an authentication URL with `?token=`. The browser exchanges it for a cookie and lands on the clean root. Without a valid cookie or the current process token, the root returns 401. The token can be exchanged repeatedly during that process's lifetime; it is not consumed on first use.
 
 This repo folds that flow into a console-less exe:
 
@@ -36,7 +36,7 @@ This repo folds that flow into a console-less exe:
 5. Open Edge `--app=<tokenUrl>` once, maximize it, then publish a tray icon.
 6. Closing the window (X / Alt+F4 / Ctrl+Shift+W) only **hides it to the tray**; the backend keeps running.
 7. Tray menu → Quit → Job Object kills the node tree and frees the port.
-8. Tray menu → Restart → the backend comes back up in place (window and tray stay put); dshmarket's own Restart works too.
+8. Tray or market restart → wait for authenticated readiness, validate the HTTP exchange, then swap the app window; the tray icon remains.
 
 ---
 
@@ -51,7 +51,7 @@ This repo folds that flow into a console-less exe:
 | Right-click tray icon → Show window | Same |
 | **Right-click tray icon → Restart backend** | **Reclaim and relaunch the backend, and swap in a fresh app window (a full refresh, new page)** |
 | **Run the exe again with `--restart`** | **Same as the tray item (handy for a shortcut)** |
-| Restart from dshmarket | Backend restarts **and the launcher swaps in a fresh window** using the replacement host's new token, which it reads from dshmarket's own restart log — the page is always authenticated |
+| Restart from dshmarket | Wait for an owned listener, a complete auth log line, and a verified token exchange, then swap the window |
 | Right-click tray icon → Quit and stop backend | Close window + kill process tree + remove tray icon + exit |
 | Window destroyed by anything else (taskbar preview close, browser crash, …) | Reclaim the backend and exit too — no zombie processes |
 
@@ -59,23 +59,25 @@ None of the three "hide to tray" paths shows any notification, and none of them 
 
 Hotkeys are intercepted only while the **app window is focused**, so they never steal `Alt+F4` / `Ctrl+Shift+W` from other programs.
 
-### How restart works
+### Restart readiness
 
-When the backend's main process exits, the launcher does **not** reclaim immediately. It enters a "restart watch window" (30 s by default):
+The market helper and replacement remain in the launcher's Job Object. Reclaiming the job as soon as the old process exits would kill them. A listening port is not sufficient either: DSH listens first, then finishes plugin loading and startup auditing, and only then prints its authentication URL.
 
-1. the port is being listened on again → treat it as a successful restart, adopt the new process and keep supervising; tray icon and window stay put;
-2. no process left in the job, or the watch window expires → treat it as a real exit and reclaim everything.
+The launcher completes a market restart in this order:
 
-The signal is the **port**, not the main process handle, because dshmarket restarts by having the main process kill itself and letting a **detached helper** bring a replacement up once the port is free. That helper is still inside the launcher's Job Object (measured), so watching the main process handle used to kill the helper and its replacement too — which is exactly why "click Restart" used to leave the tray icon gone and the page spinning.
+1. Require a new listener inside the current Job, excluding the old PID and unrelated processes.
+2. Keep reading the tail of `%TEMP%\\dsh-market-restart-*.out.log`; accept only complete token lines for the same loopback port and root path.
+3. Do not discard a log by modification time. On Windows, a live stdout writer may keep mtime stale. The current server, not a timestamp, determines whether a token is current.
+4. Verify with a new WinHTTP session: token request → **303 and a `dsh-auth-` cookie** → root request with that cookie → **200, HTML, and the DSH boot marker**. Do not use Edge cookies, proxies, or external redirects.
+5. Only then adopt the backend and swap the window. Re-arm the destroy hook before closing the old window. If the old window was hidden, hide the replacement too.
 
+The observation budget is 60 seconds. Each HTTP operation has a one-second timeout bounded by the remaining budget. An empty job, auth timeout, or window-swap failure is reported as ERROR and reclaims the owned backend; it is not silently reported as success.
 
-### A tray restart also swaps the app window
+The tray item and `--restart` obtain the URL from their own stdout and run the same HTTP check and window swap. You need not close the window manually, but its handle changes and a visible window may briefly switch.
 
-The tray item (and `--restart`) relaunches the backend **and** opens a fresh app window with the new token, then closes the old one. If the old window was hidden in the tray, the new one keeps that state so nothing pops up. The destroy hook is re-armed for the new window, so closing the old one is not mistaken for "the user quit".
+**Verification boundary:** the HTTP check proves that the current host accepts the token and newly issued cookie. It does not inspect Edge's cookie jar, React assembly, or every plugin's rendering. This launcher does not fix DSH revision 404s, hot-update black screens, or notification-plugin bugs. The market log naming convention remains an integration dependency.
 
-Why: backing only the backend and letting the page merely reconnect leaves the page on stale client code, and it walks into the "the host's projections are still cold" race — `dsh-notification` folds an absent projection as turn 0, so every session with a completed turn looks like it just advanced and a burst of notifications fires. A fresh window is equivalent to the full reload dshmarket does.
-
-If the UI still does not come back after a tray restart (say a bundle that cannot be fetched kept one plugin out of sync), press **Ctrl+R** in the window — it stays open, so you can refresh any time.
+The v2.3.2 fake tests omitted persistent log writers and delayed readiness output; their pass did not establish that a real market restart was fixed. The regression suite now covers those cases and distinguishes fixture tests, real DSH HTTP verification, and full UI acceptance.
 
 ---
 
@@ -125,9 +127,9 @@ dsh_desktop.exe ── single-instance check (already running → focus it, exit
         ├─ X / Alt+F4 / Ctrl+Shift+W ──▶ hide to tray (backend keeps running)
         │
         ├─ tray "Restart" / --restart / dshmarket's Restart
-        │        └─▶ restart watch window: wait for the port to be listened on again
-        │               ├─ it is back ──▶ adopt the new process (tray and window stay put)
-        │               └─ nothing came back / job empty ──▶ treat as a real exit
+        │        └─▶ owned listener + complete auth output + verified HTTP exchange
+        │               ├─ verified ──▶ adopt the process and swap the window (tray remains)
+        │               └─ timeout / empty job / swap failure ──▶ report error and reclaim
         │
         └─ tray menu "Quit" ──▶ TerminateJobObject ──▶ reclaim process tree / free port
 ```
@@ -168,6 +170,14 @@ The script first compiles `src/dsh_desktop.rc` (which embeds the tray icon `src/
 Output: `bin/dsh_desktop.exe`. The GCC path links with `-static -static-libgcc -static-libstdc++`, so the binary does not depend on MinGW runtime DLLs.
 
 > The GCC path is tested on MinGW-w64 GCC 15; the Clang and MSVC paths are untested.
+
+### Isolated regression suite
+
+```powershell
+.\scripts\test.ps1
+```
+
+Requires MinGW-w64 GCC and Node. Tests use private temporary directories, OS-assigned ports, and child processes they own. They do not open Edge or operate on the user's DSH instance. Coverage includes live log writers, stale mtime, complete lines, delayed output, stale tokens, exchange responses, Job/PID ownership, and timeout. Passing the HTTP fixture is not full market/UI acceptance.
 
 ---
 
