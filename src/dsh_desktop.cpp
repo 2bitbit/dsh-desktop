@@ -106,6 +106,7 @@ namespace Config {
     constexpr DWORD RESTART_WATCH_MS          = 30000;        // 后台主进程退出后，等它被拉回来的观察窗
     constexpr DWORD RESTART_POLL_INTERVAL_MS  = 300;          // 观察窗内的探测间隔
     constexpr DWORD PORT_RELEASE_WAIT_MS      = 3000;         // 托盘重启前，等旧后台让出端口
+    constexpr DWORD MAX_RESTART_LOG_BYTES     = 262144;       // 读市场重启日志的上限（只为找一行 URL）
     constexpr int  IDI_DSH_TRAY               = 101;          // 必须与 dsh_desktop.rc 中的 ID 一致
     constexpr DWORD HIDE_HOTKEY_VK            = 'W';          // Ctrl+Shift+W：等价于左键点叉号
     constexpr int  CAPTION_BAND_LOGICAL_PX    = 120;          // 只在窗口顶部这条带内做关闭按钮判定
@@ -342,6 +343,32 @@ HANDLE WaitForBackendRestart(int port, DWORD timeoutMs);
  * @return 是否重启成功。
  */
 bool RestartBackend();
+
+/**
+ * @brief 用新的认证 URL 换一个应用窗口：开新窗 → 锁定 → 重挂销毁钩子 → 关旧窗。
+ *
+ * 新 token 的兑换是无条件成功的，因此换窗后必然是一个已鉴权的页面；
+ * 这比"让旧窗口自己 reload"可靠——旧窗口依赖 cookie，而 cookie 的失败模式不止一种。
+ *
+ * @param authUrl 新后台打印的认证 URL。
+ * @param hStdoutForDrain 仍在手里的 stdout 读端（可为 NULL，仅用于顺带排空）。
+ * @param stdoutAcc 排空累积缓冲。
+ * @return 是否成功换窗。
+ */
+bool SwapAppWindow(const std::wstring& authUrl, HANDLE hStdoutForDrain, std::string& stdoutAcc);
+
+/**
+ * @brief 从 dshmarket 的重启日志里取出替补 host 打印的认证 URL。
+ *
+ * dshmarket 把替补 host 的 stdout 写到 `%TEMP%\dsh-market-restart-<stamp>.out.log`
+ * （dshmarket/src/restart.ts 建文件名，恢复面 spawn 时重定向进去）。市场发起的重启
+ * 不是我们拉起的，拿不到它的 stdout 管道，所以只能从这里读；读不到就退化为保留旧窗口。
+ *
+ * @param notBefore 只接受不早于该时刻写过的日志（避免拿到上一轮的旧 URL）。
+ * @param[out] outUrl 解析到的认证 URL。
+ * @return 是否取到。
+ */
+bool ReadMarketRestartAuthUrl(const FILETIME& notBefore, std::wstring& outUrl);
 
 /**
  * @brief 添加托盘图标（图标取自内嵌资源 IDI_DSH_TRAY）。
@@ -1321,38 +1348,7 @@ bool RestartBackend() {
     // 5) 换应用窗口：用新 token 重开一个，再把旧窗口关掉。
     //    托盘重启不会让页面整页重载，而"只重连"会踩到插件的冷投影竞态（重启后弹一串通知），
     //    也让前端停在旧代码上；换一个全新窗口就与 dshmarket 那次整页重载等价了。
-    HWND oldWindow = GlobalState::g_TargetHwnd;
-    bool keepHidden = (oldWindow != NULL && IsWindow(oldWindow) && !IsWindowVisible(oldWindow));
-    std::vector<HWND> oldWindows = SnapshotExistingAppWindows();
-
-    if (LaunchAppWithAuthUrl(FromUtf8(url))) {
-        DWORD newPid = 0;
-        HWND newWindow = CaptureAppWindowWithPid(oldWindows, Config::APP_CAPTURE_TIMEOUT_MS, newPid, hStdoutRead, acc);
-        if (newWindow != NULL) {
-            // 先把监控目标切到新窗口，再关旧的：旧窗口此刻已不是监控目标，
-            // 它的销毁事件既不会命中 g_TargetHwnd，挂钩也已换到新 PID。
-            GlobalState::g_TargetHwnd = newWindow;
-            GlobalState::g_TargetPid = newPid;
-            GlobalState::g_AppClosed = false;
-            InstallWindowDestroyHook(newWindow, newPid);
-            LogMessage("INFO", "已锁定新的应用窗口 HWND: " + std::to_string(reinterpret_cast<uintptr_t>(newWindow))
-                               + ", PID: " + std::to_string(newPid));
-            if (keepHidden) {
-                ShowWindow(newWindow, SW_HIDE);
-                LogMessage("INFO", "旧窗口当时收在托盘里，新窗口沿用该状态，不打扰你");
-            } else {
-                MaximizeAppWindow(newWindow);
-            }
-            if (oldWindow != NULL && IsWindow(oldWindow)) {
-                PostMessageW(oldWindow, WM_CLOSE, 0, 0);
-                LogMessage("INFO", "已关闭旧应用窗口");
-            }
-        } else {
-            LogMessage("WARN", "没能捕获到新的应用窗口，保留旧窗口（页面会自动重连；必要时按 Ctrl+R）");
-        }
-    } else {
-        LogMessage("WARN", "没能唤起新的应用窗口，保留旧窗口（页面会自动重连；必要时按 Ctrl+R）");
-    }
+    SwapAppWindow(FromUtf8(url), hStdoutRead, acc);
 
     // 6) 接管新后台
     GlobalState::g_Job = job;
@@ -1366,6 +1362,115 @@ bool RestartBackend() {
     StartConsoleDrainThread(hStdoutRead);
     GlobalState::g_Restarting = false;
     LogMessage("INFO", "后台已重启并就绪，应用窗口已换成新页面");
+    return true;
+}
+
+bool SwapAppWindow(const std::wstring& authUrl, HANDLE hStdoutForDrain, std::string& stdoutAcc) {
+    HWND oldWindow = GlobalState::g_TargetHwnd;
+    bool keepHidden = (oldWindow != NULL && IsWindow(oldWindow) && !IsWindowVisible(oldWindow));
+    std::vector<HWND> oldWindows = SnapshotExistingAppWindows();
+
+    if (!LaunchAppWithAuthUrl(authUrl)) {
+        LogMessage("WARN", "没能唤起新的应用窗口，保留旧窗口（必要时在窗口里按 Ctrl+R）");
+        return false;
+    }
+
+    DWORD newPid = 0;
+    HWND newWindow = CaptureAppWindowWithPid(oldWindows, Config::APP_CAPTURE_TIMEOUT_MS, newPid, hStdoutForDrain, stdoutAcc);
+    if (newWindow == NULL) {
+        LogMessage("WARN", "没能捕获到新的应用窗口，保留旧窗口（必要时在窗口里按 Ctrl+R）");
+        return false;
+    }
+
+    // 先把监控目标切到新窗口，再关旧的：旧窗口此刻已不是监控目标，
+    // 它的销毁事件既不会命中 g_TargetHwnd，挂钩也已换到新 PID。
+    GlobalState::g_TargetHwnd = newWindow;
+    GlobalState::g_TargetPid = newPid;
+    GlobalState::g_AppClosed = false;
+    InstallWindowDestroyHook(newWindow, newPid);
+    LogMessage("INFO", "已锁定新的应用窗口 HWND: " + std::to_string(reinterpret_cast<uintptr_t>(newWindow))
+                       + ", PID: " + std::to_string(newPid));
+
+    if (keepHidden) {
+        ShowWindow(newWindow, SW_HIDE);
+        LogMessage("INFO", "旧窗口当时收在托盘里，新窗口沿用该状态，不打扰你");
+    } else {
+        MaximizeAppWindow(newWindow);
+    }
+    if (oldWindow != NULL && IsWindow(oldWindow)) {
+        PostMessageW(oldWindow, WM_CLOSE, 0, 0);
+        LogMessage("INFO", "已关闭旧应用窗口");
+    }
+    return true;
+}
+
+bool ReadMarketRestartAuthUrl(const FILETIME& notBefore, std::wstring& outUrl) {
+    wchar_t tempPath[MAX_PATH];
+    DWORD length = GetTempPathW(MAX_PATH, tempPath);
+    if (length == 0 || length >= MAX_PATH) {
+        LogMessage("WARN", "取不到 %TEMP% 路径，无法读市场重启日志");
+        return false;
+    }
+
+    WIN32_FIND_DATAW found;
+    ZeroMemory(&found, sizeof(found));
+    std::wstring pattern = std::wstring(tempPath) + L"dsh-market-restart-*.out.log";
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &found);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        LogMessage("INFO", "没有市场重启日志（%TEMP%\\dsh-market-restart-*.out.log），不换窗口");
+        return false;
+    }
+
+    std::wstring newest;
+    FILETIME newestTime;
+    ZeroMemory(&newestTime, sizeof(newestTime));
+    do {
+        if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        if (CompareFileTime(&found.ftLastWriteTime, &notBefore) < 0) continue;   // 上一轮重启留下的
+        if (newest.empty() || CompareFileTime(&found.ftLastWriteTime, &newestTime) > 0) {
+            newest = std::wstring(tempPath) + found.cFileName;
+            newestTime = found.ftLastWriteTime;
+        }
+    } while (FindNextFileW(hFind, &found));
+    FindClose(hFind);
+
+    if (newest.empty()) {
+        LogMessage("INFO", "市场重启日志都早于本次重启，不换窗口");
+        return false;
+    }
+
+    HANDLE hFile = CreateFileW(newest.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        LogMessage("WARN", "市场重启日志打不开，LastError: " + std::to_string(GetLastError()));
+        return false;
+    }
+    std::string content;
+    char buffer[4096];
+    DWORD read = 0;
+    while (content.size() < Config::MAX_RESTART_LOG_BYTES
+           && ReadFile(hFile, buffer, sizeof(buffer), &read, NULL) && read > 0) {
+        content.append(buffer, read);
+    }
+    CloseHandle(hFile);
+
+    const std::string marker = "dsh web: ";
+    size_t at = content.rfind(marker);
+    if (at == std::string::npos) {
+        LogMessage("WARN", "市场重启日志里没有认证 URL 行（替补 host 可能没起来）");
+        return false;
+    }
+    at += marker.size();
+    size_t end = content.find_first_of(" \t\r\n", at);
+    if (end == std::string::npos) end = content.size();
+    std::string url = content.substr(at, end - at);
+    if (url.compare(0, 4, "http") != 0) {
+        LogMessage("WARN", "市场重启日志里的认证 URL 不合法，忽略");
+        return false;
+    }
+
+    LogMessage("INFO", "从市场重启日志取到替补 host 的认证 URL: " + RedactToken(url));
+    outUrl = FromUtf8(url);
     return true;
 }
 
@@ -2095,13 +2200,26 @@ void RunEventDrivenLifecyclePump(HWND targetHwnd, DWORD targetPid) {
         if (waitRes == WAIT_OBJECT_0) {
             // 主进程退出了，但这不等于"服务结束"：dshmarket 的重启就是主进程自杀，
             // 由脱离进程的助手把替补拉起来，助手与替补都还在我们的作业里。
+            FILETIME exitTime;
+            GetSystemTimeAsFileTime(&exitTime);   // 只认此后写过的市场重启日志
             LogMessage("INFO", "后台主进程已退出：先看作业里还有没有人（区分「重启中」与「真结束」）");
             HANDLE restarted = WaitForBackendRestart(GlobalState::g_ServerPort, Config::RESTART_WATCH_MS);
             if (restarted != NULL) {
                 CloseHandle(GlobalState::g_BackendProcess);
                 GlobalState::g_BackendProcess = restarted;
-                LogMessage("INFO", "继续监督新的后台进程；托盘图标与窗口保持不动"
-                                   "（页面会自动重连，窗口不需要关）");
+
+                // 市场发起的重启不是我们拉起的，拿不到它的 stdout；改用它的新 token 换一个新窗口，
+                // 页面因此必然已鉴权（旧窗口只靠 cookie，而 cookie 的失败模式不可控）。
+                std::wstring freshUrl;
+                std::string stdoutAcc;
+                if (ReadMarketRestartAuthUrl(exitTime, freshUrl)) {
+                    SwapAppWindow(freshUrl, NULL, stdoutAcc);
+                } else {
+                    LogMessage("WARN", "没取到替补 host 的认证 URL，保留旧窗口；"
+                                       "若窗口里显示鉴权失败，请退出后重开应用");
+                }
+
+                LogMessage("INFO", "继续监督新的后台进程；托盘图标保持不动");
                 continue;
             }
             LogMessage("WARN", "后台没有回来，按真正结束处理");
