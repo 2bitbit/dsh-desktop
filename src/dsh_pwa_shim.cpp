@@ -1,18 +1,34 @@
 /**
  * @file dsh_pwa_shim.cpp
- * @brief DSH Web 静默守护与生命周期联动 Shim (快捷方式参数驱动 + 直通 Node)
+ * @brief DSH Web 静默守护与生命周期联动 Shim（快捷方式参数驱动 + 直通 Node + 托盘常驻）
  *
  * 功能职责：
  * 1. 后台工作目录由快捷方式参数 (--cwd <dir>) 提供，0 硬编码。
  * 2. 直通 Node.js 启动：从 pnpm 的 dsh shim 读取 cmd-shim-target，跳过 PowerShell。
  * 3. 将 Node stdout/stderr 接到匿名管道（同时避免无窗口模式下的 stdout 崩溃）。
  * 4. 将后台进程绑定入 Windows Job Object（JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE）。
- * 5. 立刻显示原生启动窗（不打开无 token 的页面，避免 404/401）。
- * 6. 从 stdout 解析 `dsh web: http://127.0.0.1:<port>/?token=...`（0.1.2 起根路径强制认证）。
- * 7. token 就绪后只拉起一次 Edge --app=<tokenUrl>，用户第一眼是 DSH 自己的加载页。
- * 8. 捕获窗口 HWND/PID 并立即最大化；SetWinEventHook + MsgWaitForMultipleObjects 事件驱动等待。
- * 9. 窗口关闭时 TerminateJobObject，回收 node 进程树并释放端口。
- * 10. 每次启动清空 exe 同级 dsh_pwa_shim.log / dsh_web_console.log；运行中追加，分别 512KB / 2MB 防爆。token 入日志时脱敏。
+ * 5. 单实例：隐藏控制窗 + FindWindow 判定；重复运行只前置已有窗口，不再起第二套后台。
+ * 6. 立刻显示原生启动窗（不打开无 token 的页面，避免 404/401）。
+ * 7. 从 stdout 解析 `dsh web: http://127.0.0.1:<port>/?token=...`（0.1.2 起根路径强制认证）。
+ * 8. token 就绪后只拉起一次 Edge --app=<tokenUrl>，用户第一眼是 DSH 自己的加载页。
+ * 9. 捕获窗口 HWND/PID 并立即最大化；SetWinEventHook + MsgWaitForMultipleObjects 事件驱动等待。
+ * 10. 关闭语义（WH_MOUSE_LL / WH_KEYBOARD_LL 拦截，详见 IsCloseIntercepted / IsHideHotkey）：
+ *     - 左键点标题栏叉号、Alt+F4、Ctrl+Shift+W → 窗口隐藏到托盘，后台继续运行（都不弹任何通知）；
+ *     - 右键托盘菜单「退出」→ 关闭应用窗口并回收后台进程树；
+ *     - 窗口被其它途径销毁（任务栏预览关闭、浏览器崩溃等）→ 同样回收后台再退出，不留僵尸进程。
+ * 11. 托盘图标：左键单击前置窗口；右键弹出菜单；图标内嵌自 IDI_DSH_TRAY 资源；Explorer 重启后自动重建。
+ * 12. 进程按「每显示器 DPI 感知 v2」运行：低层钩子给物理坐标，DPI 不感知会让关闭按钮判定差一个缩放比。
+ * 13. 每次启动清空 exe 同级 dsh_pwa_shim.log / dsh_web_console.log；运行中追加，分别 512KB / 2MB 防爆。token 入日志时脱敏。
+ *
+ * 构建：
+ *   1) 托盘图标是内嵌资源：图标 src/tray_icon.ico，资源脚本 src/dsh_pwa_shim.rc
+ *      （其 ID 必须与 Config::IDI_DSH_TRAY 一致；windres 以 .rc 所在目录解析图标路径）。
+ *   2) 直接跑 scripts/build.ps1：自动编译资源 + 自动挑 GCC / Clang / MSVC。
+ *   3) 手工等价命令（MinGW-w64 GCC，静态链接，成品不依赖 MinGW 运行时 DLL）：
+ *        windres -c 65001 src/dsh_pwa_shim.rc -O coff -o bin/dsh_pwa_shim.res
+ *        g++ -O2 -std=c++17 -municode -mwindows -static -static-libgcc -static-libstdc++ \
+ *            src/dsh_pwa_shim.cpp bin/dsh_pwa_shim.res -o bin/dsh_pwa_shim.exe \
+ *            -lshlwapi -lshell32 -lole32 -luser32 -lgdi32
  */
 
 #ifndef UNICODE
@@ -28,6 +44,7 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -45,8 +62,9 @@
 namespace Config {
     constexpr const wchar_t* APP_WINDOW_CLASS = L"Chrome_WidgetWin_1";
     constexpr const wchar_t* SPLASH_CLASS    = L"DshPwaShimSplash";
-    constexpr int SPLASH_WIDTH               = 440;
-    constexpr int SPLASH_HEIGHT              = 240;
+    constexpr int SPLASH_WIDTH_LOGICAL       = 440;
+    constexpr int SPLASH_HEIGHT_LOGICAL      = 240;
+    constexpr int SPLASH_FONT_HEIGHT_LOGICAL = 12;
     constexpr const wchar_t* APP_TITLE_KW1   = L"DeepSeek";
     constexpr const wchar_t* APP_TITLE_KW2   = L"Harness";
     constexpr const wchar_t* APP_TITLE_KW3   = L"dsh";
@@ -65,12 +83,36 @@ namespace Config {
     constexpr DWORD APP_CAPTURE_INTERVAL_MS  = 30;
 
     constexpr const char* AUTH_URL_MARKER    = "dsh web: ";
+
+    // ---- 单实例 / 托盘 / 关闭拦截 ----
+    constexpr const wchar_t* CONTROLLER_CLASS = L"DshPwaShimController";
+    constexpr const wchar_t* CONTROLLER_TITLE = L"DSH Desktop Shim Controller";
+    constexpr const wchar_t* TASKBAR_CREATED_MSG = L"TaskbarCreated";
+    constexpr const wchar_t* TRAY_TIP         = L"DeepSeek Harness（左键显示 / 右键菜单 / Ctrl+Shift+W 收起）";
+    constexpr UINT WM_DSH_ACTIVATE            = WM_APP + 1;   // 第二个实例请求前置窗口
+    constexpr UINT WM_DSH_TRAY                = WM_APP + 2;   // 托盘图标回调
+    constexpr UINT WM_DSH_HIDDEN              = WM_APP + 3;   // 刚刚隐藏到托盘（只记日志，不弹任何通知）
+    constexpr UINT TRAY_ICON_ID               = 1;
+    constexpr UINT TRAY_MENU_SHOW             = 1;
+    constexpr UINT TRAY_MENU_QUIT             = 2;
+    constexpr int  IDI_DSH_TRAY               = 101;          // 必须与 dsh_pwa_shim.rc 中的 ID 一致
+    constexpr DWORD HIDE_HOTKEY_VK            = 'W';          // Ctrl+Shift+W：等价于左键点叉号
+    constexpr int  CAPTION_BAND_LOGICAL_PX    = 120;          // 只在窗口顶部这条带内做关闭按钮判定
+    constexpr DWORD HIT_TEST_TIMEOUT_MS       = 100;
 }
+
+// ==========================================
+// 动态解析的 user32 导出（DPI 相关，Windows 10 1607 起必备）
+// ==========================================
+typedef BOOL (WINAPI *PFN_SetProcessDpiAwarenessContext)(HANDLE);
+typedef UINT (WINAPI *PFN_GetDpiForWindow)(HWND);
+typedef UINT (WINAPI *PFN_GetDpiForSystem)(void);
 
 // ==========================================
 // 全局状态 (事件钩子回调与主线程通信)
 // ==========================================
 namespace GlobalState {
+    static HINSTANCE g_Instance = NULL;
     static HWND g_TargetHwnd = NULL;
     static DWORD g_TargetPid = 0;
     static bool g_AppClosed = false;
@@ -78,12 +120,46 @@ namespace GlobalState {
     static HANDLE g_DrainThread = NULL;
     static HWND g_SplashHwnd = NULL;
     static bool g_SplashCancelled = false;
+    static HFONT g_SplashFont = NULL;
     static wchar_t g_SplashStatus[160];
+
+    static HWND g_ControllerHwnd = NULL;
+    static UINT g_TaskbarCreatedMsg = 0;
+    static HHOOK g_MouseHook = NULL;
+    static HHOOK g_KeyboardHook = NULL;
+    static bool g_SwallowButtonUp = false;
+    static bool g_CloseInterceptReady = false;
+    static bool g_TrayAdded = false;
+    static HICON g_TrayIcon = NULL;
+    static UINT g_SystemDpi = 96;
+    static PFN_GetDpiForWindow g_GetDpiForWindow = NULL;
 }
 
 // ==========================================
 // 符号声明 (报纸结构前置)
 // ==========================================
+
+/**
+ * @brief 开启每显示器 DPI 感知 v2 并缓存系统 DPI 与窗口 DPI 查询入口。
+ * @return 必需 API 是否可用；不可用时调用方应 fail-fast。
+ */
+bool SetupDpiAwareness();
+
+/**
+ * @brief 把逻辑像素换算成当前系统 DPI 下的物理像素（启动窗尺寸与字体用）。
+ * @param logical 逻辑像素。
+ * @return 物理像素。
+ */
+int DpiScale(int logical);
+
+/**
+ * @brief 从 user32.dll 动态取函数指针（用 memcpy 规避 -Wcast-function-type 告警）。
+ * @tparam T 目标函数指针类型。
+ * @param name 导出名。
+ * @return 函数指针，缺失时为 NULL。
+ */
+template <typename T>
+T LoadUser32(const char* name);
 
 /**
  * @brief 获取当前可执行文件所在目录绝对路径。
@@ -130,6 +206,102 @@ std::wstring FromUtf8(const std::string& str);
  * @return 脱敏后的文本。
  */
 std::string RedactToken(const std::string& text);
+
+/**
+ * @brief 单实例判定：若已有实例在跑，把前台特权转交给它并请它前置窗口。
+ * @return true 表示已有实例接管，本进程应立即退出。
+ */
+bool ActivateExistingInstance();
+
+/**
+ * @brief 创建隐藏控制窗：单实例锚点 + 托盘回调 + 跨实例消息宿主。
+ * @param hInstance 当前模块实例。
+ * @return 控制窗 HWND，失败返回 NULL。
+ */
+HWND CreateControllerWindow(HINSTANCE hInstance);
+
+/**
+ * @brief 控制窗过程：处理托盘回调、第二个实例的前置请求、托盘重建。
+ */
+LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+/**
+ * @brief 安装关闭语义拦截钩子（低层鼠标 + 低层键盘）。
+ * @return 两个钩子是否都安装成功。
+ */
+bool InstallCloseInterceptors();
+
+/**
+ * @brief 卸载关闭语义拦截钩子。
+ */
+void UninstallCloseInterceptors();
+
+/**
+ * @brief 低层鼠标钩子：命中标题栏叉号则隐藏到托盘并吞掉这次点击。
+ */
+LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam);
+
+/**
+ * @brief 低层键盘钩子：应用窗口在前台时把「隐藏热键」转成隐藏到托盘。
+ */
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+
+/**
+ * @brief 判断这次按键是不是隐藏热键（Alt+F4 或 Ctrl+Shift+W）。
+ * @param kb 低层键盘钩子给出的按键信息。
+ * @return 是否命中热键。
+ */
+bool IsHideHotkey(const KBDLLHOOKSTRUCT* kb);
+
+/**
+ * @brief 判断应用窗口此刻是不是前台窗口（热键只在应用窗口受控时才吞，不抢别的程序的快捷键）。
+ * @return 应用窗口是否处于前台。
+ */
+bool IsAppWindowForeground();
+
+/**
+ * @brief 判断某个屏幕点位是否是一次「点叉号」。
+ * @param pt 屏幕物理坐标（低层钩子给出的原始坐标）。
+ * @return 是否应拦截。
+ */
+bool IsCloseIntercepted(const POINT& pt);
+
+/**
+ * @brief 把应用窗口隐藏到托盘（钩子回调里只做最小动作）。
+ */
+void HideMainWindowToTray();
+
+/**
+ * @brief 前置应用窗口；窗口还没建好时前置启动窗。
+ */
+void ActivateMainWindow();
+
+/**
+ * @brief 处理托盘图标的鼠标回调。
+ * @param lParam 回调消息的 lParam（低 16 位为鼠标消息）。
+ */
+void HandleTrayCallback(LPARAM lParam);
+
+/**
+ * @brief 在光标处弹出托盘右键菜单。
+ */
+void ShowTrayMenu();
+
+/**
+ * @brief 托盘菜单「退出」：关闭应用窗口并让主循环走回收路径。
+ */
+void RequestQuit();
+
+/**
+ * @brief 添加托盘图标（图标取自内嵌资源 IDI_DSH_TRAY）。
+ * @return 是否添加成功。
+ */
+bool AddTrayIcon();
+
+/**
+ * @brief 移除托盘图标并释放图标句柄。
+ */
+void RemoveTrayIcon();
 
 /**
  * @brief 初始化 Windows Job Object (KillOnClose)。
@@ -194,7 +366,7 @@ HWND CreateSplashWindow(HINSTANCE hInstance);
 void SetSplashStatus(const wchar_t* status);
 
 /**
- * @brief 销毁原生启动窗。
+ * @brief 销毁原生启动窗并释放其字体。
  */
 void DestroySplashWindow();
 
@@ -278,21 +450,50 @@ bool IsDebugMode(LPCWSTR lpCmdLine);
  * @brief Win32 GUI 入口点（MinGW -municode 要求 wWinMain），彻底免去控制台黑框。
  */
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
-    (void)hInstance;
     (void)hPrevInstance;
     (void)nCmdShow;
 
+    GlobalState::g_Instance = hInstance;
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     bool debug = IsDebugMode(lpCmdLine);
+
+    // 前提检查 1：DPI 感知 API。缺了它，低层钩子的物理坐标与窗口矩形会差一个缩放比。
+    if (!SetupDpiAwareness()) {
+        MessageBoxW(NULL, L"本程序需要 Windows 10 1607 及以上（缺少 DPI 感知 API），无法保证关闭按钮判定准确。",
+                    L"DSH Shim 环境检查失败", MB_ICONERROR);
+        CoUninitialize();
+        return 1;
+    }
+
+    // 前提检查 2：单实例。必须早于 TruncateShimLog，否则会把正在运行实例的日志清空。
+    if (ActivateExistingInstance()) {
+        CoUninitialize();
+        return 0;
+    }
+
     TruncateShimLog();
     GlobalState::g_ConsoleLog = OpenConsoleLog();
     if (GlobalState::g_ConsoleLog == NULL) {
         LogMessage("WARN", "无法创建 dsh_web_console.log，dsh web 输出不会落盘");
     }
     LogMessage("INFO", "========== DSH Desktop Shim 启动 ==========");
+    LogMessage("INFO", "进程已开启每显示器 DPI 感知 v2，系统 DPI: " + std::to_string(GlobalState::g_SystemDpi));
     if (debug) {
         LogMessage("DEBUG", "已启用调试模式");
+    }
+
+    // 前提检查 3：控制窗 + 关闭语义钩子。窗口还没起来，失败也不影响后台。
+    if (CreateControllerWindow(hInstance) == NULL) {
+        LogMessage("ERROR", "创建控制窗失败，LastError: " + std::to_string(GetLastError()));
+        if (debug) MessageBoxW(NULL, L"创建控制窗失败，无法保证单实例与托盘行为", L"DSH Shim 错误", MB_ICONERROR);
+        CoUninitialize();
+        return 6;
+    }
+    if (!InstallCloseInterceptors()) {
+        LogMessage("ERROR", "关闭语义钩子安装失败：叉号与 Alt+F4 将直接关闭程序（托盘菜单仍可用）");
+        MessageBoxW(NULL, L"关闭语义钩子安装失败，叉号与 Alt+F4 会直接关闭程序。\n详见 exe 同级 dsh_pwa_shim.log。",
+                    L"DSH Shim 警告", MB_ICONWARNING);
     }
 
     std::wstring workingDir = ResolveTargetWorkingDirectory();
@@ -350,6 +551,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         }
         CleanupBackendProcess(hJob, pi.hProcess, hStdoutRead);
         DestroySplashWindow();
+        UninstallCloseInterceptors();
         CoUninitialize();
         return GlobalState::g_SplashCancelled ? 0 : 4;
     }
@@ -363,6 +565,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         if (debug) MessageBoxW(NULL, L"唤起 Edge 应用窗口失败", L"DSH Shim 错误", MB_ICONERROR);
         CleanupBackendProcess(hJob, pi.hProcess, hStdoutRead);
         DestroySplashWindow();
+        UninstallCloseInterceptors();
         CoUninitialize();
         return 5;
     }
@@ -377,7 +580,16 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         LogMessage("INFO", "已锁定目标窗口 HWND: " + std::to_string(reinterpret_cast<uintptr_t>(targetHwnd)) + ", PID: " + std::to_string(targetPid));
         MaximizeAppWindow(targetHwnd);
     } else {
-        LogMessage("WARN", "未能精确锁定特定 HWND，启用全局窗口销毁事件监听");
+        LogMessage("ERROR", "未能锁定应用窗口 HWND：本次运行没有托盘入口，叉号会直接关闭程序");
+    }
+
+    if (targetHwnd != NULL) {
+        if (AddTrayIcon()) {
+            GlobalState::g_CloseInterceptReady = true;
+            LogMessage("INFO", "关闭语义已生效：叉号 / Alt+F4 → 托盘；真关闭 = 右键托盘菜单「退出」");
+        } else {
+            LogMessage("ERROR", "托盘图标不可用：为免窗口被藏到无法恢复，本次运行不拦截叉号");
+        }
     }
 
     DestroySplashWindow();
@@ -386,6 +598,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     RunEventDrivenLifecyclePump(targetHwnd, targetPid, pi.hProcess);
 
     LogMessage("INFO", "窗口已销毁，正在强制清理后台进程树 ...");
+    RemoveTrayIcon();
+    UninstallCloseInterceptors();
     CleanupBackendProcess(hJob, pi.hProcess, hStdoutRead);
     CoUninitialize();
     LogMessage("INFO", "========== DSH Desktop Shim 正常退出 (后台已完全回收) ==========");
@@ -396,6 +610,37 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 // ==========================================
 // 详细功能与辅助函数实现
 // ==========================================
+
+template <typename T>
+T LoadUser32(const char* name) {
+    T fn = NULL;
+    FARPROC raw = GetProcAddress(GetModuleHandleW(L"user32.dll"), name);
+    if (raw != NULL) {
+        memcpy(&fn, &raw, sizeof(fn));
+    }
+    return fn;
+}
+
+bool SetupDpiAwareness() {
+    PFN_SetProcessDpiAwarenessContext setCtx =
+        LoadUser32<PFN_SetProcessDpiAwarenessContext>("SetProcessDpiAwarenessContext");
+    PFN_GetDpiForSystem getSystemDpi = LoadUser32<PFN_GetDpiForSystem>("GetDpiForSystem");
+    GlobalState::g_GetDpiForWindow = LoadUser32<PFN_GetDpiForWindow>("GetDpiForWindow");
+    if (setCtx == NULL || getSystemDpi == NULL || GlobalState::g_GetDpiForWindow == NULL) {
+        return false;
+    }
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4
+    if (!setCtx((HANDLE)-4)) {
+        LogMessage("ERROR", "SetProcessDpiAwarenessContext 调用失败，LastError: " + std::to_string(GetLastError()));
+        return false;
+    }
+    GlobalState::g_SystemDpi = getSystemDpi();
+    return true;
+}
+
+int DpiScale(int logical) {
+    return MulDiv(logical, static_cast<int>(GlobalState::g_SystemDpi), 96);
+}
 
 std::wstring GetExeDirectory() {
     wchar_t path[MAX_PATH];
@@ -556,6 +801,337 @@ bool IsDebugMode(LPCWSTR lpCmdLine) {
     }
     return false;
 }
+
+// ==========================================
+// 单实例：控制窗与第二个实例的前置请求
+// ==========================================
+
+bool ActivateExistingInstance() {
+    HWND existing = FindWindowW(Config::CONTROLLER_CLASS, Config::CONTROLLER_TITLE);
+    if (existing == NULL) {
+        return false;
+    }
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(existing, &pid);
+    BOOL granted = AllowSetForegroundWindow(pid);
+    if (!PostMessageW(existing, Config::WM_DSH_ACTIVATE, 0, 0)) {
+        DWORD err = GetLastError();
+        LogMessage("ERROR", "发现已有实例 (PID " + std::to_string(pid) + ") 但前置消息投递失败，LastError: " + std::to_string(err));
+        MessageBoxW(NULL,
+                    L"DSH 已在运行，但本次无法把它的窗口前置（消息投递失败）。\n"
+                    L"请手动切换到已有窗口，或在托盘菜单里退出后重试。",
+                    L"DSH Shim", MB_ICONWARNING);
+        return true;
+    }
+    LogMessage("INFO", "检测到已有实例 (PID " + std::to_string(pid) + ")，已请求它前置窗口；本次进程直接退出"
+                       "（前台特权转交: " + std::string(granted ? "成功" : "失败") + "）");
+    return true;
+}
+
+HWND CreateControllerWindow(HINSTANCE hInstance) {
+    WNDCLASSW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = ControllerWndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = Config::CONTROLLER_CLASS;
+    if (RegisterClassW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return NULL;
+    }
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW,
+        Config::CONTROLLER_CLASS,
+        Config::CONTROLLER_TITLE,
+        WS_POPUP,
+        0, 0, 0, 0,
+        NULL, NULL, hInstance, NULL
+    );
+    if (hwnd == NULL) {
+        return NULL;
+    }
+
+    GlobalState::g_ControllerHwnd = hwnd;
+    GlobalState::g_TaskbarCreatedMsg = RegisterWindowMessageW(Config::TASKBAR_CREATED_MSG);
+    return hwnd;
+}
+
+LRESULT CALLBACK ControllerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (GlobalState::g_TaskbarCreatedMsg != 0 && msg == GlobalState::g_TaskbarCreatedMsg) {
+        LogMessage("INFO", "Explorer 已重启，重建托盘图标");
+        if (GlobalState::g_TrayAdded) {
+            GlobalState::g_TrayAdded = false;
+            AddTrayIcon();
+        }
+        return 0;
+    }
+
+    switch (msg) {
+        case Config::WM_DSH_ACTIVATE:
+            LogMessage("INFO", "收到第二个实例的前置请求");
+            ActivateMainWindow();
+            return 0;
+        case Config::WM_DSH_HIDDEN:
+            LogMessage("INFO", "应用窗口已隐藏到托盘，后台继续运行（重新显示：左键托盘图标或再运行一次 exe）");
+            return 0;
+        case Config::WM_DSH_TRAY:
+            HandleTrayCallback(lParam);
+            return 0;
+        default:
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+}
+
+// ==========================================
+// 关闭语义拦截：低层鼠标 / 键盘钩子 + 托盘
+// ==========================================
+
+bool InstallCloseInterceptors() {
+    GlobalState::g_MouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, GlobalState::g_Instance, 0);
+    if (GlobalState::g_MouseHook == NULL) {
+        LogMessage("ERROR", "SetWindowsHookEx(WH_MOUSE_LL) 失败，LastError: " + std::to_string(GetLastError()));
+        return false;
+    }
+    GlobalState::g_KeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GlobalState::g_Instance, 0);
+    if (GlobalState::g_KeyboardHook == NULL) {
+        LogMessage("ERROR", "SetWindowsHookEx(WH_KEYBOARD_LL) 失败，LastError: " + std::to_string(GetLastError()));
+        UnhookWindowsHookEx(GlobalState::g_MouseHook);
+        GlobalState::g_MouseHook = NULL;
+        return false;
+    }
+    LogMessage("INFO", "低层输入钩子已安装（WH_MOUSE_LL + WH_KEYBOARD_LL）");
+    return true;
+}
+
+void UninstallCloseInterceptors() {
+    if (GlobalState::g_MouseHook != NULL) {
+        UnhookWindowsHookEx(GlobalState::g_MouseHook);
+        GlobalState::g_MouseHook = NULL;
+    }
+    if (GlobalState::g_KeyboardHook != NULL) {
+        UnhookWindowsHookEx(GlobalState::g_KeyboardHook);
+        GlobalState::g_KeyboardHook = NULL;
+    }
+    GlobalState::g_CloseInterceptReady = false;
+}
+
+bool IsCloseIntercepted(const POINT& pt) {
+    // 拦截只有在「托盘图标已就绪」时才允许：否则窗口一藏就没有任何入口能把它叫回来。
+    if (!GlobalState::g_CloseInterceptReady || GlobalState::g_AppClosed) {
+        return false;
+    }
+    HWND app = GlobalState::g_TargetHwnd;
+    if (app == NULL || !IsWindow(app) || !IsWindowVisible(app)) {
+        return false;
+    }
+
+    RECT rc;
+    if (!GetWindowRect(app, &rc) || !PtInRect(&rc, pt)) {
+        return false;
+    }
+
+    // 只在窗口顶部这条带里跨进程询问命中码：页面内的普通点击不必付这次 IPC 的代价。
+    UINT dpi = GlobalState::g_GetDpiForWindow(app);
+    if (pt.y >= rc.top + MulDiv(Config::CAPTION_BAND_LOGICAL_PX, static_cast<int>(dpi), 96)) {
+        return false;
+    }
+
+    // Chromium 自绘标题栏也会如实回答 WM_NCHITTEST：关闭按钮返回 HTCLOSE，标题栏返回 HTCAPTION。
+    DWORD_PTR hit = 0;
+    if (SendMessageTimeoutW(app, WM_NCHITTEST, 0, MAKELPARAM(pt.x, pt.y),
+                            SMTO_ABORTIFHUNG | SMTO_BLOCK, Config::HIT_TEST_TIMEOUT_MS, &hit) == 0) {
+        LogMessage("WARN", "询问窗口命中码超时，本次点击不拦截");
+        return false;
+    }
+    return (LRESULT)hit == HTCLOSE;
+}
+
+LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        if (wParam == WM_LBUTTONDOWN) {
+            MSLLHOOKSTRUCT* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+            if (IsCloseIntercepted(ms->pt)) {
+                GlobalState::g_SwallowButtonUp = true;   // 抬起也要吞，否则会落到别的窗口上
+                HideMainWindowToTray();
+                return 1;
+            }
+        } else if (wParam == WM_LBUTTONUP && GlobalState::g_SwallowButtonUp) {
+            GlobalState::g_SwallowButtonUp = false;
+            return 1;
+        }
+    }
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+        KBDLLHOOKSTRUCT* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        if (IsHideHotkey(kb) && GlobalState::g_CloseInterceptReady && !GlobalState::g_AppClosed &&
+            IsAppWindowForeground()) {
+            HideMainWindowToTray();
+            return 1;   // 吞掉热键，别让 Chromium 走它自己的关闭逻辑
+        }
+    }
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+bool IsHideHotkey(const KBDLLHOOKSTRUCT* kb) {
+    if (kb->vkCode == VK_F4 && (kb->flags & LLKHF_ALTDOWN) != 0) {
+        return true;   // Alt+F4
+    }
+    // Ctrl+Shift+W：低层钩子的 flags 只报 Alt，Ctrl/Shift 要问异步键状态。
+    if (kb->vkCode == Config::HIDE_HOTKEY_VK &&
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
+        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) {
+        return true;
+    }
+    return false;
+}
+
+bool IsAppWindowForeground() {
+    HWND app = GlobalState::g_TargetHwnd;
+    if (app == NULL || !IsWindow(app) || !IsWindowVisible(app)) {
+        return false;
+    }
+    HWND foreground = GetForegroundWindow();
+    return foreground == app || (foreground != NULL && IsChild(app, foreground));
+}
+
+void HideMainWindowToTray() {
+    HWND app = GlobalState::g_TargetHwnd;
+    if (app == NULL || !IsWindow(app) || !IsWindowVisible(app)) {
+        return;
+    }
+    ShowWindow(app, SW_HIDE);
+    // 钩子回调里只做最小动作：日志交给控制窗消息处理，避免拖慢输入线程。
+    PostMessageW(GlobalState::g_ControllerHwnd, Config::WM_DSH_HIDDEN, 0, 0);
+}
+
+void ActivateMainWindow() {
+    HWND app = GlobalState::g_TargetHwnd;
+    if (app != NULL && IsWindow(app)) {
+        ShowWindow(app, IsIconic(app) ? SW_RESTORE : SW_SHOW);
+        if (!SetForegroundWindow(app)) {
+            LogMessage("WARN", "SetForegroundWindow 失败，窗口可能仍在其它窗口之后");
+        }
+        BringWindowToTop(app);
+        LogMessage("INFO", "已前置应用窗口");
+        return;
+    }
+
+    HWND splash = GlobalState::g_SplashHwnd;
+    if (splash != NULL && IsWindow(splash)) {
+        SetForegroundWindow(splash);
+        LogMessage("INFO", "应用窗口尚未就绪，已前置启动窗");
+    }
+}
+
+void HandleTrayCallback(LPARAM lParam) {
+    switch (LOWORD(lParam)) {
+        case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+            ActivateMainWindow();
+            break;
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU:
+            ShowTrayMenu();
+            break;
+        default:
+            break;
+    }
+}
+
+void ShowTrayMenu() {
+    HMENU menu = CreatePopupMenu();
+    if (menu == NULL) {
+        LogMessage("ERROR", "CreatePopupMenu 失败，LastError: " + std::to_string(GetLastError()));
+        return;
+    }
+    AppendMenuW(menu, MF_STRING, Config::TRAY_MENU_SHOW, L"显示窗口(&S)");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, Config::TRAY_MENU_QUIT, L"退出并结束后台(&X)");
+    SetMenuDefaultItem(menu, Config::TRAY_MENU_SHOW, FALSE);
+
+    POINT cursor;
+    GetCursorPos(&cursor);
+    SetForegroundWindow(GlobalState::g_ControllerHwnd);   // 托盘菜单的经典要求：先抢前台，菜单才会正常消失
+    UINT cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                              cursor.x, cursor.y, 0, GlobalState::g_ControllerHwnd, NULL);
+    DestroyMenu(menu);
+    PostMessageW(GlobalState::g_ControllerHwnd, WM_NULL, 0, 0);
+
+    if (cmd == Config::TRAY_MENU_SHOW) {
+        ActivateMainWindow();
+    } else if (cmd == Config::TRAY_MENU_QUIT) {
+        RequestQuit();
+    }
+}
+
+void RequestQuit() {
+    LogMessage("INFO", "托盘菜单请求退出：关闭应用窗口并回收后台");
+    HWND app = GlobalState::g_TargetHwnd;
+    if (app != NULL && IsWindow(app)) {
+        PostMessageW(app, WM_CLOSE, 0, 0);
+    }
+    PostQuitMessage(0);   // 不依赖窗口是否响应，回收路径固定走主循环出口
+}
+
+bool AddTrayIcon() {
+    if (GlobalState::g_ControllerHwnd == NULL) {
+        return false;
+    }
+
+    if (GlobalState::g_TrayIcon == NULL) {
+        int size = GetSystemMetrics(SM_CXSMICON);
+        GlobalState::g_TrayIcon = reinterpret_cast<HICON>(LoadImageW(
+            GlobalState::g_Instance,
+            MAKEINTRESOURCEW(Config::IDI_DSH_TRAY),
+            IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
+        if (GlobalState::g_TrayIcon == NULL) {
+            LogMessage("ERROR", "内嵌托盘图标加载失败 (IDI_DSH_TRAY)，LastError: " + std::to_string(GetLastError()));
+            return false;
+        }
+    }
+
+    NOTIFYICONDATAW nid;
+    ZeroMemory(&nid, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = GlobalState::g_ControllerHwnd;
+    nid.uID = Config::TRAY_ICON_ID;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = Config::WM_DSH_TRAY;
+    nid.hIcon = GlobalState::g_TrayIcon;
+    lstrcpynW(nid.szTip, Config::TRAY_TIP, ARRAYSIZE(nid.szTip));
+
+    if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
+        LogMessage("ERROR", "Shell_NotifyIcon(NIM_ADD) 失败，LastError: " + std::to_string(GetLastError()));
+        return false;
+    }
+    GlobalState::g_TrayAdded = true;
+    LogMessage("INFO", "托盘图标已添加（左键显示窗口，右键菜单可退出）");
+    return true;
+}
+
+void RemoveTrayIcon() {
+    if (GlobalState::g_TrayAdded && GlobalState::g_ControllerHwnd != NULL) {
+        NOTIFYICONDATAW nid;
+        ZeroMemory(&nid, sizeof(nid));
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = GlobalState::g_ControllerHwnd;
+        nid.uID = Config::TRAY_ICON_ID;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        GlobalState::g_TrayAdded = false;
+        LogMessage("INFO", "托盘图标已移除");
+    }
+    if (GlobalState::g_TrayIcon != NULL) {
+        DestroyIcon(GlobalState::g_TrayIcon);
+        GlobalState::g_TrayIcon = NULL;
+    }
+}
+
+// ==========================================
+// 后台进程：启动、管道与 Job Object
+// ==========================================
 
 HANDLE InitializeJobObject() {
     HANDLE hJob = CreateJobObjectW(NULL, NULL);
@@ -847,6 +1423,10 @@ bool WaitForAuthUrl(HANDLE hStdoutRead, HANDLE hProcess, HWND cancelHwnd, DWORD 
     return false;
 }
 
+// ==========================================
+// 启动窗与 Edge 应用窗口
+// ==========================================
+
 std::wstring ResolveEdgeFile(const wchar_t* relative) {
     const wchar_t* envNames[] = { L"ProgramFiles(x86)", L"ProgramFiles" };
     for (size_t i = 0; i < 2; ++i) {
@@ -940,17 +1520,26 @@ static LRESULT CALLBACK SplashWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             FillRect(hdc, &rc, bg);
             DeleteObject(bg);
 
+            HFONT oldFont = NULL;
+            if (GlobalState::g_SplashFont != NULL) {
+                oldFont = reinterpret_cast<HFONT>(SelectObject(hdc, GlobalState::g_SplashFont));
+            }
+
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, RGB(240, 240, 240));
             RECT titleRc = rc;
-            titleRc.top += 56;
-            titleRc.bottom = titleRc.top + 40;
+            titleRc.top += DpiScale(56);
+            titleRc.bottom = titleRc.top + DpiScale(40);
             DrawTextW(hdc, L"DeepSeek Harness", -1, &titleRc, DT_CENTER | DT_SINGLELINE);
 
             SetTextColor(hdc, RGB(170, 170, 170));
             RECT statusRc = rc;
-            statusRc.top = titleRc.bottom + 12;
+            statusRc.top = titleRc.bottom + DpiScale(12);
             DrawTextW(hdc, GlobalState::g_SplashStatus, -1, &statusRc, DT_CENTER | DT_SINGLELINE);
+
+            if (oldFont != NULL) {
+                SelectObject(hdc, oldFont);
+            }
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -967,7 +1556,7 @@ static LRESULT CALLBACK SplashWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 }
 
 HWND CreateSplashWindow(HINSTANCE hInstance) {
-    lstrcpynW(GlobalState::g_SplashStatus, L"正在启动 ...", 160);
+    lstrcpynW(GlobalState::g_SplashStatus, L"正在启动 ...", ARRAYSIZE(GlobalState::g_SplashStatus));
     GlobalState::g_SplashCancelled = false;
 
     WNDCLASSW wc;
@@ -979,14 +1568,23 @@ HWND CreateSplashWindow(HINSTANCE hInstance) {
     wc.lpszClassName = Config::SPLASH_CLASS;
     RegisterClassW(&wc);
 
-    int x = (GetSystemMetrics(SM_CXSCREEN) - Config::SPLASH_WIDTH) / 2;
-    int y = (GetSystemMetrics(SM_CYSCREEN) - Config::SPLASH_HEIGHT) / 2;
+    if (GlobalState::g_SplashFont == NULL) {
+        GlobalState::g_SplashFont = CreateFontW(
+            -DpiScale(Config::SPLASH_FONT_HEIGHT_LOGICAL), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+    }
+
+    int width = DpiScale(Config::SPLASH_WIDTH_LOGICAL);
+    int height = DpiScale(Config::SPLASH_HEIGHT_LOGICAL);
+    int x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
+    int y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
     HWND hwnd = CreateWindowExW(
         WS_EX_APPWINDOW | WS_EX_TOPMOST,
         Config::SPLASH_CLASS,
         L"DeepSeek Harness",
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        x, y, Config::SPLASH_WIDTH, Config::SPLASH_HEIGHT,
+        x, y, width, height,
         NULL, NULL, hInstance, NULL
     );
     if (hwnd == NULL) return NULL;
@@ -998,7 +1596,7 @@ HWND CreateSplashWindow(HINSTANCE hInstance) {
 }
 
 void SetSplashStatus(const wchar_t* status) {
-    lstrcpynW(GlobalState::g_SplashStatus, status ? status : L"", 160);
+    lstrcpynW(GlobalState::g_SplashStatus, status ? status : L"", ARRAYSIZE(GlobalState::g_SplashStatus));
     if (GlobalState::g_SplashHwnd) {
         InvalidateRect(GlobalState::g_SplashHwnd, NULL, TRUE);
         UpdateWindow(GlobalState::g_SplashHwnd);
@@ -1011,6 +1609,10 @@ void DestroySplashWindow() {
         DestroyWindow(GlobalState::g_SplashHwnd);
         GlobalState::g_SplashHwnd = NULL;
         PumpPendingMessages();
+    }
+    if (GlobalState::g_SplashFont != NULL) {
+        DeleteObject(GlobalState::g_SplashFont);
+        GlobalState::g_SplashFont = NULL;
     }
 }
 

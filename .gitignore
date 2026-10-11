@@ -5,6 +5,7 @@
 *.exe
 *.obj
 *.o
+*.res
 *.pdb
 *.ilk
 
