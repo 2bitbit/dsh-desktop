@@ -17,9 +17,10 @@
  *     - 右键托盘菜单「退出」→ 关闭应用窗口并回收后台进程树；
  *     - 窗口被其它途径销毁（任务栏预览关闭、浏览器崩溃等）→ 同样回收后台再退出，不留僵尸进程。
  * 11. 托盘图标：左键单击前置窗口；右键弹出菜单；图标内嵌自 IDI_DSH_TRAY 资源；Explorer 重启后自动重建。
- * 12. 重启支持：后台主进程退出后先进「重启观察窗」（等端口重新被监听），而不是立即回收。
- *     这样 dshmarket 的「重启」（主进程自杀 + 脱离进程的助手拉起替补）能活下来；
- *     观察窗内若发现作业里已无存活进程、或超时，才按真正结束处理。
+ * 12. 重启支持：旧后台退出后等待作业内的新监听者、完整认证日志和成功的 HTTP 兑换。
+ *     端口监听早于 loader/audit 完成，不能单独作为就绪判据；持续写入日志也不能按 mtime 淘汰。
+ *     通过新 token → 303 + cookie → 首页 200 + 引导标记验证后才换窗。
+ *     作业已空、认证超时或换窗失败时显式报错并回收，不把失败报告成成功。
  *     托盘菜单另有「重启后台」，由本程序自己完成回收与重启（不依赖 dshmarket 的助手）。
  * 13. 进程按「每显示器 DPI 感知 v2」运行：低层钩子给物理坐标，DPI 不感知会让关闭按钮判定差一个缩放比。
  * 14. 每次启动清空 exe 同级 dsh_desktop.log / dsh_web_console.log；运行中追加，分别 512KB / 2MB 防爆。token 入日志时脱敏。
@@ -32,7 +33,7 @@
  *        windres -c 65001 src/dsh_desktop.rc -O coff -o bin/dsh_desktop.res
  *        g++ -O2 -std=c++17 -municode -mwindows -static -static-libgcc -static-libstdc++ \
  *            src/dsh_desktop.cpp bin/dsh_desktop.res -o bin/dsh_desktop.exe \
- *            -lshlwapi -lshell32 -lole32 -luser32 -lgdi32 -liphlpapi -lws2_32
+ *            -lshlwapi -lshell32 -lole32 -luser32 -lgdi32 -liphlpapi -lws2_32 -lwinhttp
  */
 
 #ifndef UNICODE
@@ -49,6 +50,7 @@
 #include <shlwapi.h>
 #include <winsock2.h>     // ntohs：TCP 表里的本地端口是网络字节序
 #include <iphlpapi.h>     // GetExtendedTcpTable：查端口现在归谁监听
+#include <winhttp.h>      // 仅对本作业的回环主机验证 token 兑换与首页响应
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -103,10 +105,12 @@ namespace Config {
     constexpr UINT TRAY_MENU_RESTART          = 2;
     constexpr UINT TRAY_MENU_QUIT             = 3;
     constexpr UINT WM_DSH_RESTART             = WM_APP + 4;   // 第二个实例带 --restart 时请求重启后台
-    constexpr DWORD RESTART_WATCH_MS          = 30000;        // 后台主进程退出后，等它被拉回来的观察窗
     constexpr DWORD RESTART_POLL_INTERVAL_MS  = 300;          // 观察窗内的探测间隔
     constexpr DWORD PORT_RELEASE_WAIT_MS      = 3000;         // 托盘重启前，等旧后台让出端口
-    constexpr DWORD MAX_RESTART_LOG_BYTES     = 262144;       // 读市场重启日志的上限（只为找一行 URL）
+    constexpr DWORD MAX_RESTART_LOG_BYTES     = 262144;       // 只读日志尾部，避免长时间运行日志阻塞主线程
+    constexpr DWORD AUTH_HTTP_TIMEOUT_MS      = 1000;         // 单次回环 HTTP 操作上限
+    constexpr DWORD MAX_AUTH_HTML_BYTES       = 256 * 1024;    // 验证首页引导标记的读取上限
+    constexpr DWORD MAX_AUTH_HEADER_BYTES     = 16 * 1024;     // 认证响应头的读取上限
     constexpr int  IDI_DSH_TRAY               = 101;          // 必须与 dsh_desktop.rc 中的 ID 一致
     constexpr DWORD HIDE_HOTKEY_VK            = 'W';          // Ctrl+Shift+W：等价于左键点叉号
     constexpr int  CAPTION_BAND_LOGICAL_PX    = 120;          // 只在窗口顶部这条带内做关闭按钮判定
@@ -328,47 +332,45 @@ int ParseUrlPort(const std::string& url);
 DWORD FindPortListenerPid(int port);
 
 /**
- * @brief 重启观察窗：后台主进程退出后，等它被（dshmarket 的脱离进程助手）拉回来。
- *
- * 判据是「端口重新有人监听」而不是「主进程句柄」——重启期间作业里始终有助手/替补活着，
- * 所以绝不能一看到主进程退出就回收。
- * @param port 期望重新被监听的端口。
- * @param timeoutMs 观察窗时长。
- * @return 新后台的进程句柄；没能重启则返回 NULL。
+ * @brief 等待作业内的新监听进程、完整认证日志和成功的 token 兑换。
+ * @param port 期望恢复的回环端口。
+ * @param timeoutMs 有界观察时长。
+ * @param[out] outAuthUrl 经 HTTP 验证的本轮认证 URL。
+ * @return 已验证的新后台句柄；失败返回 NULL，不接管外部进程。
  */
-HANDLE WaitForBackendRestart(int port, DWORD timeoutMs);
+HANDLE WaitForBackendRestart(int port, DWORD timeoutMs, std::string& outAuthUrl);
 
-/**
- * @brief 托盘菜单「重启后台」：回收当前后台并原样重启，窗口与托盘图标保持不动。
- * @return 是否重启成功。
- */
+/** @brief 托盘重启后台并换新页面；失败显式记错，不报告已换窗。 */
 bool RestartBackend();
 
 /**
- * @brief 用新的认证 URL 换一个应用窗口：开新窗 → 锁定 → 重挂销毁钩子 → 关旧窗。
- *
- * 新 token 的兑换是无条件成功的，因此换窗后必然是一个已鉴权的页面；
- * 这比"让旧窗口自己 reload"可靠——旧窗口依赖 cookie，而 cookie 的失败模式不止一种。
- *
- * @param authUrl 新后台打印的认证 URL。
- * @param hStdoutForDrain 仍在手里的 stdout 读端（可为 NULL，仅用于顺带排空）。
+ * @brief 用已验证的认证 URL 开新窗，重挂监控后关闭旧窗。
+ * @param authUrl 新后台打印的认证 URL；调用方负责先验证 HTTP 鉴权。
+ * @param hStdoutForDrain 可选 stdout 读端；市场重启时没有该管道。
  * @param stdoutAcc 排空累积缓冲。
- * @return 是否成功换窗。
+ * @return 是否捕获到新窗口；窗口捕获本身不证明浏览器内鉴权成功。
  */
 bool SwapAppWindow(const std::wstring& authUrl, HANDLE hStdoutForDrain, std::string& stdoutAcc);
 
 /**
- * @brief 从 dshmarket 的重启日志里取出替补 host 打印的认证 URL。
- *
- * dshmarket 把替补 host 的 stdout 写到 `%TEMP%\dsh-market-restart-<stamp>.out.log`
- * （dshmarket/src/restart.ts 建文件名，恢复面 spawn 时重定向进去）。市场发起的重启
- * 不是我们拉起的，拿不到它的 stdout 管道，所以只能从这里读；读不到就退化为保留旧窗口。
- *
- * @param notBefore 只接受不早于该时刻写过的日志（避免拿到上一轮的旧 URL）。
- * @param[out] outUrl 解析到的认证 URL。
- * @return 是否取到。
+ * @brief 读取市场日志尾部的完整认证 URL，不以修改时间淘汰持续写入的日志。
+ * @param port 仅允许 http://127.0.0.1 的同端口根 URL。
+ * @return 去重后的候选；陈旧 token 必须再由当前服务器拒绝，不能凭时间戳判定。
  */
-bool ReadMarketRestartAuthUrl(const FILETIME& notBefore, std::wstring& outUrl);
+std::vector<std::string> ReadMarketRestartAuthUrls(int port);
+
+/**
+ * @brief 用全新的、无浏览器 cookie 的 WinHTTP 会话验证 token 兑换。
+ * @param url 回环同端口根 URL；禁止外部主机和其他查询参数。
+ * @param port 期望的监听端口。
+ * @param[out] outStatus 最后收到的 HTTP 状态；没有响应时为 0。
+ * @return token 返回 303 和认证 cookie，且该 cookie 能取得含引导标记的首页时才成功。
+ */
+bool VerifyAuthUrl(const std::string& url, int port, DWORD& outStatus,
+                   DWORD budgetMs = 6 * Config::AUTH_HTTP_TIMEOUT_MS);
+
+/** @brief 严格校验本机同端口认证 URL 的结构与 base64url token。 */
+static bool IsLocalAuthUrl(const std::string& url, int port);
 
 /**
  * @brief 添加托盘图标（图标取自内嵌资源 IDI_DSH_TRAY）。
@@ -622,10 +624,19 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     LogMessage("INFO", "后台服务进程已创建 (PID: " + std::to_string(pi.dwProcessId) + ")");
 
     if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
-        LogMessage("ERROR", "AssignProcessToJobObject 绑定失败，LastError: " + std::to_string(GetLastError()));
-    } else {
-        LogMessage("INFO", "已成功将后台服务进程绑定至 Job Object 树");
+        const DWORD error = GetLastError();
+        LogMessage("ERROR", "AssignProcessToJobObject 绑定失败，拒绝启动后台，LastError: " + std::to_string(error));
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 3000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        CloseHandle(hStdoutRead);
+        CloseHandle(hJob);
+        DestroySplashWindow();
+        CoUninitialize();
+        return 3;
     }
+    LogMessage("INFO", "已成功将后台服务进程绑定至 Job Object 树");
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
 
@@ -1160,19 +1171,35 @@ void HandleTrayCallback(LPARAM lParam) {
     }
 }
 
-void ShowTrayMenu() {
+/** @brief 构造托盘菜单；重启状态只改变标志，不改变命令 ID。 */
+static HMENU CreateTrayMenu() {
     HMENU menu = CreatePopupMenu();
+    if (menu == NULL) return NULL;
+    if (!AppendMenuW(menu, MF_STRING, Config::TRAY_MENU_SHOW, L"显示窗口(&S)")) {
+        DestroyMenu(menu);
+        return NULL;
+    }
+    // 禁用标志属于 uFlags，不得混入菜单 ID（2 | MF_GRAYED 会错误变成退出项 3）。
+    if (!AppendMenuW(menu, MF_STRING | (GlobalState::g_Restarting ? MF_GRAYED : 0),
+                     Config::TRAY_MENU_RESTART, L"重启后台(&R)")) {
+        DestroyMenu(menu);
+        return NULL;
+    }
+    if (!AppendMenuW(menu, MF_SEPARATOR, 0, NULL)
+        || !AppendMenuW(menu, MF_STRING, Config::TRAY_MENU_QUIT, L"退出并结束后台(&X)")) {
+        DestroyMenu(menu);
+        return NULL;
+    }
+    SetMenuDefaultItem(menu, Config::TRAY_MENU_SHOW, FALSE);
+    return menu;
+}
+
+void ShowTrayMenu() {
+    HMENU menu = CreateTrayMenu();
     if (menu == NULL) {
-        LogMessage("ERROR", "CreatePopupMenu 失败，LastError: " + std::to_string(GetLastError()));
+        LogMessage("ERROR", "托盘菜单创建失败，LastError: " + std::to_string(GetLastError()));
         return;
     }
-    AppendMenuW(menu, MF_STRING, Config::TRAY_MENU_SHOW, L"显示窗口(&S)");
-    AppendMenuW(menu, MF_STRING,
-                Config::TRAY_MENU_RESTART | (GlobalState::g_Restarting ? MF_GRAYED : 0),
-                L"重启后台(&R)");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, Config::TRAY_MENU_QUIT, L"退出并结束后台(&X)");
-    SetMenuDefaultItem(menu, Config::TRAY_MENU_SHOW, FALSE);
 
     POINT cursor;
     GetCursorPos(&cursor);
@@ -1232,55 +1259,83 @@ DWORD FindPortListenerPid(int port) {
     }
     auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buffer.data());
     for (DWORD i = 0; i < table->dwNumEntries; ++i) {
-        if (ntohs(static_cast<u_short>(table->table[i].dwLocalPort)) == static_cast<u_short>(port)) {
-            return table->table[i].dwOwningPid;
+        const auto& row = table->table[i];
+        if (ntohs(static_cast<u_short>(row.dwLocalPort)) == static_cast<u_short>(port)
+            && (row.dwLocalAddr == 0 || row.dwLocalAddr == htonl(INADDR_LOOPBACK))) {
+            return row.dwOwningPid;
         }
     }
     return 0;
 }
 
-HANDLE WaitForBackendRestart(int port, DWORD timeoutMs) {
-    if (port <= 0) {
-        LogMessage("WARN", "没有可用端口（认证 URL 未解析出端口），无法判断后台是否回来");
+HANDLE WaitForBackendRestart(int port, DWORD timeoutMs, std::string& outAuthUrl) {
+    outAuthUrl.clear();
+    if (port <= 0 || GlobalState::g_Job == NULL) {
+        LogMessage("ERROR", "重启观察缺少有效端口或作业句柄，拒绝接管进程");
         return NULL;
     }
 
-    DWORD startTick = GetTickCount();
-    LogMessage("INFO", "重启观察窗开始：等端口 " + std::to_string(port) + " 重新被监听（最多 "
+    const ULONGLONG startTick = GetTickCount64();
+    const DWORD oldPid = GetProcessId(GlobalState::g_BackendProcess);
+    DWORD observedPid = 0;
+    std::vector<std::string> rejectedUrls;
+    DWORD lastStatus = 0;
+    LogMessage("INFO", "重启观察开始：等待本作业内的监听者、完整认证 URL 与 HTTP 鉴权（最多 "
                        + std::to_string(timeoutMs / 1000) + " 秒）");
 
-    while ((GetTickCount() - startTick) < timeoutMs) {
+    while (GetTickCount64() - startTick < timeoutMs) {
         PumpPendingMessages();
-        if (GlobalState::g_AppClosed) {
-            LogMessage("INFO", "观察窗内收到退出请求，不再等待");
-            return NULL;
-        }
-
-        DWORD pid = FindPortListenerPid(port);
-        if (pid != 0) {
-            HANDLE handle = OpenProcess(SYNCHRONIZE, FALSE, pid);
-            if (handle != NULL) {
-                LogMessage("INFO", "端口 " + std::to_string(port) + " 已恢复监听（新后台 PID "
-                                   + std::to_string(pid) + "），重启成功");
-                return handle;
+        if (GlobalState::g_AppClosed) return NULL;
+        const DWORD pid = FindPortListenerPid(port);
+        HANDLE handle = pid != 0 && pid != oldPid
+            ? OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
+        BOOL belongs = FALSE;
+        if (handle != NULL && IsProcessInJob(handle, GlobalState::g_Job, &belongs) && belongs) {
+            if (observedPid != pid) {
+                observedPid = pid;
+                rejectedUrls.clear();
+                LogMessage("INFO", "作业内 PID " + std::to_string(pid)
+                                   + " 已监听；继续等完整认证输出，尚不认定重启成功");
             }
-            // 端口刚恢复但进程打不开，通常是查询与打开之间的竞态：继续等下一轮
-            LogMessage("WARN", "端口已恢复但进程句柄打不开，继续观察，LastError: " + std::to_string(GetLastError()));
+            for (const std::string& url : ReadMarketRestartAuthUrls(port)) {
+                const ULONGLONG elapsed = GetTickCount64() - startTick;
+                if (elapsed >= timeoutMs) break;
+                if (std::find(rejectedUrls.begin(), rejectedUrls.end(), url) != rejectedUrls.end()) continue;
+                const DWORD remaining = timeoutMs - static_cast<DWORD>(elapsed);
+                BOOL stillBelongs = FALSE;
+                if (WaitForSingleObject(handle, 0) != WAIT_TIMEOUT
+                    || !IsProcessInJob(handle, GlobalState::g_Job, &stillBelongs)
+                    || !stillBelongs || FindPortListenerPid(port) != pid) {
+                    CloseHandle(handle);
+                    continue;
+                }
+                if (VerifyAuthUrl(url, port, lastStatus, remaining)
+                    && WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+                    && IsProcessInJob(handle, GlobalState::g_Job, &stillBelongs)
+                    && stillBelongs && FindPortListenerPid(port) == pid) {
+                    outAuthUrl = url;
+                    LogMessage("INFO", "新后台 PID " + std::to_string(pid)
+                                       + " 已通过 token 兑换和首页 HTTP 验证；准备换窗");
+                    return handle;
+                }
+                // 当前进程拒绝的旧 token 不重复请求；进程变化时清空，避免误用旧会话。
+                if (lastStatus == 401 || lastStatus == 403) rejectedUrls.push_back(url);
+            }
         }
+        if (handle != NULL) CloseHandle(handle);
 
-        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
-        ZeroMemory(&accounting, sizeof(accounting));
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting = {};
         if (QueryInformationJobObject(GlobalState::g_Job, JobObjectBasicAccountingInformation,
                                       &accounting, sizeof(accounting), NULL)
             && accounting.ActiveProcesses == 0) {
-            LogMessage("INFO", "作业内已无存活进程：没有人在重启，按真正结束处理");
+            LogMessage("ERROR", "作业内已无存活进程，重启无法继续");
             return NULL;
         }
-
         Sleep(Config::RESTART_POLL_INTERVAL_MS);
     }
 
-    LogMessage("WARN", "重启观察窗超时，按真正结束处理");
+    LogMessage("ERROR", "重启认证就绪超时（最后 HTTP 状态 " + std::to_string(lastStatus)
+                        + "）；没有完成认证或换窗，不能报告重启成功");
     return NULL;
 }
 
@@ -1328,10 +1383,22 @@ bool RestartBackend() {
         PostQuitMessage(0);   // 没有后台可管了，按退出处理（窗口保留，用户可重新启动）
         return false;
     }
-    AssignProcessToJobObject(job, pi.hProcess);
+    if (!AssignProcessToJobObject(job, pi.hProcess)) {
+        const DWORD error = GetLastError();
+        LogMessage("ERROR", "重启后台绑定 Job Object 失败，拒绝继续，LastError: " + std::to_string(error));
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 3000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        CloseHandle(hStdoutRead);
+        CloseHandle(job);
+        GlobalState::g_Restarting = false;
+        PostQuitMessage(0);
+        return false;
+    }
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
-    LogMessage("INFO", "后台进程已重新创建 (PID: " + std::to_string(pi.dwProcessId) + ")");
+    LogMessage("INFO", "后台进程已重新创建并绑定 Job Object (PID: " + std::to_string(pi.dwProcessId) + ")");
 
     // 4) 等新的认证 URL（静默等待，不弹启动窗）
     std::string acc;
@@ -1343,25 +1410,33 @@ bool RestartBackend() {
         PostQuitMessage(0);
         return false;
     }
-    LogMessage("INFO", "已捕获新认证 URL: " + RedactToken(url));
+    const int newPort = ParseUrlPort(url);
+    DWORD status = 0;
+    if (!VerifyAuthUrl(url, newPort, status)) {
+        LogMessage("ERROR", "托盘重启认证验证失败，HTTP 状态 " + std::to_string(status));
+        CleanupBackendProcess(job, pi.hProcess, hStdoutRead);
+        GlobalState::g_Restarting = false;
+        PostQuitMessage(0);
+        return false;
+    }
+    LogMessage("INFO", "新后台已通过 token 兑换和首页 HTTP 验证");
 
-    // 5) 换应用窗口：用新 token 重开一个，再把旧窗口关掉。
-    //    托盘重启不会让页面整页重载，而"只重连"会踩到插件的冷投影竞态（重启后弹一串通知），
-    //    也让前端停在旧代码上；换一个全新窗口就与 dshmarket 那次整页重载等价了。
-    SwapAppWindow(FromUtf8(url), hStdoutRead, acc);
-
-    // 6) 接管新后台
+    // 先交接后台所有权。换窗失败不能漏回收，也不能把已出现 HWND 说成浏览器鉴权已完成。
     GlobalState::g_Job = job;
     GlobalState::g_BackendProcess = pi.hProcess;
-    int newPort = ParseUrlPort(url);
-    if (newPort != GlobalState::g_ServerPort) {
-        LogMessage("WARN", "端口变了：" + std::to_string(GlobalState::g_ServerPort) + " → " + std::to_string(newPort)
-                           + "，页面需按新地址重开（请在窗口里按 Ctrl+R，或用新快捷方式重开）");
-        GlobalState::g_ServerPort = newPort;
+    GlobalState::g_ServerPort = newPort;
+    if (GlobalState::g_AppClosed || !SwapAppWindow(FromUtf8(url), hStdoutRead, acc)) {
+        LogMessage("ERROR", "后台已验证但换窗未完成，退出并回收新后台");
+        CleanupBackendProcess(job, pi.hProcess, hStdoutRead);
+        GlobalState::g_Job = NULL;
+        GlobalState::g_BackendProcess = NULL;
+        GlobalState::g_Restarting = false;
+        PostQuitMessage(0);
+        return false;
     }
     StartConsoleDrainThread(hStdoutRead);
     GlobalState::g_Restarting = false;
-    LogMessage("INFO", "后台已重启并就绪，应用窗口已换成新页面");
+    LogMessage("INFO", "托盘重启完成：HTTP 认证已验证，新窗口已接管");
     return true;
 }
 
@@ -1377,8 +1452,10 @@ bool SwapAppWindow(const std::wstring& authUrl, HANDLE hStdoutForDrain, std::str
 
     DWORD newPid = 0;
     HWND newWindow = CaptureAppWindowWithPid(oldWindows, Config::APP_CAPTURE_TIMEOUT_MS, newPid, hStdoutForDrain, stdoutAcc);
-    if (newWindow == NULL) {
-        LogMessage("WARN", "没能捕获到新的应用窗口，保留旧窗口（必要时在窗口里按 Ctrl+R）");
+    if (newWindow == NULL
+        || std::find(oldWindows.begin(), oldWindows.end(), newWindow) != oldWindows.end()
+        || newWindow == oldWindow) {
+        LogMessage("ERROR", "捕获到的窗口不是新窗口，拒绝关闭旧窗口");
         return false;
     }
 
@@ -1404,74 +1481,212 @@ bool SwapAppWindow(const std::wstring& authUrl, HANDLE hStdoutForDrain, std::str
     return true;
 }
 
-bool ReadMarketRestartAuthUrl(const FILETIME& notBefore, std::wstring& outUrl) {
+static bool IsLocalAuthUrl(const std::string& url, int port) {
+    if (port <= 0 || port > 65535) return false;
+    const std::string prefix = "http://127.0.0.1:" + std::to_string(port) + "/?token=";
+    if (url.compare(0, prefix.size(), prefix) != 0 || url.size() == prefix.size()
+        || url.size() - prefix.size() > Config::MAX_AUTH_HEADER_BYTES) return false;
+    return std::all_of(url.begin() + prefix.size(), url.end(), [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '-' || c == '_';
+    });
+}
+
+std::vector<std::string> ReadMarketRestartAuthUrls(int port) {
+    std::vector<std::string> urls;
     wchar_t tempPath[MAX_PATH];
-    DWORD length = GetTempPathW(MAX_PATH, tempPath);
-    if (length == 0 || length >= MAX_PATH) {
-        LogMessage("WARN", "取不到 %TEMP% 路径，无法读市场重启日志");
-        return false;
-    }
+    const DWORD length = GetTempPathW(MAX_PATH, tempPath);
+    if (length == 0 || length >= MAX_PATH) return urls;
+    WIN32_FIND_DATAW found = {};
+    const std::wstring pattern = std::wstring(tempPath) + L"dsh-market-restart-*.out.log";
+    HANDLE listing = FindFirstFileW(pattern.c_str(), &found);
+    if (listing == INVALID_HANDLE_VALUE) return urls;
 
-    WIN32_FIND_DATAW found;
-    ZeroMemory(&found, sizeof(found));
-    std::wstring pattern = std::wstring(tempPath) + L"dsh-market-restart-*.out.log";
-    HANDLE hFind = FindFirstFileW(pattern.c_str(), &found);
-    if (hFind == INVALID_HANDLE_VALUE) {
-        LogMessage("INFO", "没有市场重启日志（%TEMP%\\dsh-market-restart-*.out.log），不换窗口");
-        return false;
-    }
-
-    std::wstring newest;
-    FILETIME newestTime;
-    ZeroMemory(&newestTime, sizeof(newestTime));
+    // 时间只决定读取优先级，不决定有效性：持续写入的 stdio 句柄会让 mtime 滞后。
+    std::vector<std::pair<FILETIME, std::wstring>> paths;
     do {
-        if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
-        if (CompareFileTime(&found.ftLastWriteTime, &notBefore) < 0) continue;   // 上一轮重启留下的
-        if (newest.empty() || CompareFileTime(&found.ftLastWriteTime, &newestTime) > 0) {
-            newest = std::wstring(tempPath) + found.cFileName;
-            newestTime = found.ftLastWriteTime;
+        if ((found.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0) {
+            paths.emplace_back(found.ftLastWriteTime, std::wstring(tempPath) + found.cFileName);
         }
-    } while (FindNextFileW(hFind, &found));
-    FindClose(hFind);
+    } while (FindNextFileW(listing, &found));
+    FindClose(listing);
+    std::sort(paths.begin(), paths.end(), [](const auto& a, const auto& b) {
+        return CompareFileTime(&a.first, &b.first) > 0;
+    });
 
-    if (newest.empty()) {
-        LogMessage("INFO", "市场重启日志都早于本次重启，不换窗口");
-        return false;
-    }
+    for (const auto& path : paths) {
+        HANDLE file = CreateFileW(path.second.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file == INVALID_HANDLE_VALUE) continue;
+        LARGE_INTEGER size = {};
+        if (!GetFileSizeEx(file, &size)) { CloseHandle(file); continue; }
+        LARGE_INTEGER offset = {};
+        offset.QuadPart = std::max<LONGLONG>(0, size.QuadPart - Config::MAX_RESTART_LOG_BYTES);
+        if (!SetFilePointerEx(file, offset, NULL, FILE_BEGIN)) { CloseHandle(file); continue; }
+        std::string content(static_cast<size_t>(size.QuadPart - offset.QuadPart), '\0');
+        DWORD count = 0;
+        const BOOL ok = ReadFile(file, content.data(), static_cast<DWORD>(content.size()), &count, NULL);
+        if (!ok) {
+            CloseHandle(file);
+            continue;
+        }
+        content.resize(count);
 
-    HANDLE hFile = CreateFileW(newest.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        LogMessage("WARN", "市场重启日志打不开，LastError: " + std::to_string(GetLastError()));
-        return false;
+        // 仅解析完整换行；分块输出中尚未写完的 token 绝不能拿去开窗。
+        size_t start = 0;
+        if (offset.QuadPart != 0) {
+            // offset 可能正好落在完整行起点；只有前一字节不是换行时才跳过残行。
+            LARGE_INTEGER previous{};
+            previous.QuadPart = offset.QuadPart - 1;
+            if (!SetFilePointerEx(file, previous, NULL, FILE_BEGIN)) {
+                CloseHandle(file);
+                continue;
+            }
+            char preceding = 0;
+            DWORD precedingRead = 0;
+            if (!ReadFile(file, &preceding, 1, &precedingRead, NULL) || precedingRead != 1) {
+                CloseHandle(file);
+                continue;
+            }
+            if (preceding != '\n') {
+                const size_t boundary = content.find('\n');
+                if (boundary == std::string::npos) {
+                    CloseHandle(file);
+                    continue;
+                }
+                start = boundary + 1;
+            }
+        }
+        CloseHandle(file);
+        std::vector<std::string> fileUrls;
+        while (start < content.size()) {
+            const size_t end = content.find('\n', start);
+            if (end == std::string::npos) break;
+            const std::string line = content.substr(start, end - start);
+            const size_t marker = line.find(Config::AUTH_URL_MARKER);
+            if (marker != std::string::npos) {
+                std::string url = line.substr(marker + std::strlen(Config::AUTH_URL_MARKER));
+                if (!url.empty() && url.back() == '\r') url.pop_back();
+                if (IsLocalAuthUrl(url, port)) fileUrls.push_back(url);
+            }
+            start = end + 1;
+        }
+        for (auto it = fileUrls.rbegin(); it != fileUrls.rend(); ++it) {
+            if (std::find(urls.begin(), urls.end(), *it) == urls.end()) urls.push_back(*it);
+        }
     }
-    std::string content;
-    char buffer[4096];
-    DWORD read = 0;
-    while (content.size() < Config::MAX_RESTART_LOG_BYTES
-           && ReadFile(hFile, buffer, sizeof(buffer), &read, NULL) && read > 0) {
-        content.append(buffer, read);
-    }
-    CloseHandle(hFile);
+    return urls;
+}
 
-    const std::string marker = "dsh web: ";
-    size_t at = content.rfind(marker);
-    if (at == std::string::npos) {
-        LogMessage("WARN", "市场重启日志里没有认证 URL 行（替补 host 可能没起来）");
-        return false;
-    }
-    at += marker.size();
-    size_t end = content.find_first_of(" \t\r\n", at);
-    if (end == std::string::npos) end = content.size();
-    std::string url = content.substr(at, end - at);
-    if (url.compare(0, 4, "http") != 0) {
-        LogMessage("WARN", "市场重启日志里的认证 URL 不合法，忽略");
-        return false;
-    }
+/** @brief WinHTTP 句柄的局部所有者；返回或失败时均关闭，不接触浏览器会话。 */
+struct HttpHandle {
+    HINTERNET value;
+    explicit HttpHandle(HINTERNET handle) : value(handle) {}
+    ~HttpHandle() { if (value != NULL) WinHttpCloseHandle(value); }
+    HttpHandle(const HttpHandle&) = delete;
+    HttpHandle& operator=(const HttpHandle&) = delete;
+};
 
-    LogMessage("INFO", "从市场重启日志取到替补 host 的认证 URL: " + RedactToken(url));
-    outUrl = FromUtf8(url);
+/** @brief 本机鉴权探测所需的响应字段；值仅留在内存，不打印 cookie。 */
+struct AuthHttpResponse {
+    DWORD status = 0;
+    std::wstring location;
+    std::wstring cookie;
+    std::wstring contentType;
+    std::string body;
+};
+
+/** @brief 有界读取响应头；缺少字段或过大字段返回空串，由协议验收拒绝。 */
+static std::wstring AuthResponseHeader(HINTERNET request, DWORD field) {
+    DWORD size = 0;
+    WinHttpQueryHeaders(request, field, WINHTTP_HEADER_NAME_BY_INDEX, NULL, &size, WINHTTP_NO_HEADER_INDEX);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size > Config::MAX_AUTH_HEADER_BYTES) return L"";
+    std::vector<wchar_t> buffer(size / sizeof(wchar_t) + 1, L'\0');
+    if (!WinHttpQueryHeaders(request, field, WINHTTP_HEADER_NAME_BY_INDEX,
+                             buffer.data(), &size, WINHTTP_NO_HEADER_INDEX)) return L"";
+    return std::wstring(buffer.data());
+}
+
+/** @brief 将每个同步 HTTP 操作限制在剩余观察预算内，不无限等待迟到的响应。 */
+static bool AuthHttpRemainingTimeout(HINTERNET request, ULONGLONG deadline) {
+    const ULONGLONG now = GetTickCount64();
+    if (now >= deadline) return false;
+    const int timeout = static_cast<int>(std::min<ULONGLONG>(Config::AUTH_HTTP_TIMEOUT_MS, deadline - now));
+    if (!WinHttpSetTimeouts(request, timeout, timeout, timeout, timeout)) return false;
+    // WinHTTP 文档允许 request 级 receive timeout；显式设置，避免响应体迟到时回到默认 30 秒。
+    DWORD receiveTimeout = static_cast<DWORD>(timeout);
+    return WinHttpSetOption(request, WINHTTP_OPTION_RECEIVE_TIMEOUT,
+                            &receiveTimeout, sizeof(receiveTimeout)) != FALSE;
+}
+
+/** @brief 显式关闭重定向、自动鉴权与自动 cookie，只请求已核对的回环连接。 */
+static bool AuthHttpGet(HINTERNET connection, const std::wstring& target,
+                        const std::wstring& cookie, bool readBody, ULONGLONG deadline,
+                        AuthHttpResponse& response) {
+    HttpHandle request(WinHttpOpenRequest(connection, L"GET", target.c_str(), NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0));
+    if (request.value == NULL) return false;
+    DWORD disabled = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_AUTHENTICATION;
+    if (!WinHttpSetOption(request.value, WINHTTP_OPTION_DISABLE_FEATURE, &disabled, sizeof(disabled))) return false;
+    if (!cookie.empty()) {
+        const std::wstring header = L"Cookie: " + cookie + L"\r\n";
+        if (!WinHttpAddRequestHeaders(request.value, header.c_str(), static_cast<DWORD>(-1L),
+                                      WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE)) return false;
+    }
+    if (!AuthHttpRemainingTimeout(request.value, deadline)
+        || !WinHttpSendRequest(request.value, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                               WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+        || !AuthHttpRemainingTimeout(request.value, deadline)
+        || !WinHttpReceiveResponse(request.value, NULL)) return false;
+    DWORD size = sizeof(response.status);
+    if (!WinHttpQueryHeaders(request.value, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &response.status, &size, WINHTTP_NO_HEADER_INDEX)) return false;
+    response.location = AuthResponseHeader(request.value, WINHTTP_QUERY_LOCATION);
+    response.cookie = AuthResponseHeader(request.value, WINHTTP_QUERY_SET_COOKIE);
+    response.contentType = AuthResponseHeader(request.value, WINHTTP_QUERY_CONTENT_TYPE);
+    if (readBody && response.status == 200) {
+        char buffer[4096];
+        while (response.body.size() < Config::MAX_AUTH_HTML_BYTES) {
+            DWORD count = 0;
+            if (!AuthHttpRemainingTimeout(request.value, deadline)
+                || !WinHttpReadData(request.value, buffer, sizeof(buffer), &count)) return false;
+            if (count == 0) break;
+            response.body.append(buffer, count);
+            if (response.body.find("__DSH_BOOT__") != std::string::npos) break;
+        }
+    }
     return true;
+}
+
+bool VerifyAuthUrl(const std::string& url, int port, DWORD& outStatus, DWORD budgetMs) {
+    outStatus = 0;
+    if (!IsLocalAuthUrl(url, port) || budgetMs == 0) return false;
+    const ULONGLONG deadline = GetTickCount64() + budgetMs;
+    // 每次新会话禁止继承旧 cookie。旧 token 即使浏览器 cookie 仍有效，也不能假阳性通过。
+    HttpHandle session(WinHttpOpen(L"DSH-Desktop-Auth-Check", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+    if (session.value == NULL) return false;
+    if (!WinHttpSetTimeouts(session.value, Config::AUTH_HTTP_TIMEOUT_MS, Config::AUTH_HTTP_TIMEOUT_MS,
+                            Config::AUTH_HTTP_TIMEOUT_MS, Config::AUTH_HTTP_TIMEOUT_MS)) return false;
+    HttpHandle connection(WinHttpConnect(session.value, L"127.0.0.1", static_cast<INTERNET_PORT>(port), 0));
+    if (connection.value == NULL) return false;
+    AuthHttpResponse exchange;
+    const std::wstring target = FromUtf8(url.substr(url.find('/', 7)));
+    if (!AuthHttpGet(connection.value, target, L"", false, deadline, exchange)) return false;
+    outStatus = exchange.status;
+    const size_t end = exchange.cookie.find(';');
+    const std::wstring cookie = exchange.cookie.substr(0, end);
+    const size_t equals = cookie.find('=');
+    if (exchange.status != 303 || (exchange.location != L"./" && exchange.location != L"/")
+        || cookie.compare(0, 9, L"dsh-auth-") != 0 || equals == std::wstring::npos
+        || equals <= 9 || equals + 1 >= cookie.size() || cookie.find_first_of(L"\r\n") != std::wstring::npos) return false;
+
+    AuthHttpResponse index;
+    if (!AuthHttpGet(connection.value, L"/", cookie, true, deadline, index)) return false;
+    outStatus = index.status;
+    return index.status == 200 && index.contentType.compare(0, 9, L"text/html") == 0
+        && index.body.find("__DSH_BOOT__") != std::string::npos;
 }
 
 bool AddTrayIcon() {
@@ -1722,6 +1937,7 @@ bool LaunchBackendProcess(const std::wstring& workingDir, PROCESS_INFORMATION& p
 }
 
 static bool DrainStdout(HANDLE hRead, std::string& acc) {
+    if (hRead == NULL) return true;   // 市场启动的替补没有启动器 stdout 管道
     DWORD avail = 0;
     if (!PeekNamedPipe(hRead, NULL, 0, NULL, &avail, NULL)) {
         return false;
@@ -2061,6 +2277,7 @@ HWND CaptureAppWindowWithPid(const std::vector<HWND>& oldHwnds, DWORD timeoutMs,
         wchar_t title[512];
         ZeroMemory(title, sizeof(title));
         GetWindowTextW(hwnd, title, 512);
+        if (std::find(oldHwnds.begin(), oldHwnds.end(), hwnd) != oldHwnds.end()) continue;
         std::wstring titleStr(title);
         if (titleStr.find(Config::APP_TITLE_KW1) != std::wstring::npos ||
             titleStr.find(Config::APP_TITLE_KW2) != std::wstring::npos ||
@@ -2198,31 +2415,28 @@ void RunEventDrivenLifecyclePump(HWND targetHwnd, DWORD targetPid) {
         );
 
         if (waitRes == WAIT_OBJECT_0) {
-            // 主进程退出了，但这不等于"服务结束"：dshmarket 的重启就是主进程自杀，
-            // 由脱离进程的助手把替补拉起来，助手与替补都还在我们的作业里。
-            FILETIME exitTime;
-            GetSystemTimeAsFileTime(&exitTime);   // 只认此后写过的市场重启日志
-            LogMessage("INFO", "后台主进程已退出：先看作业里还有没有人（区分「重启中」与「真结束」）");
-            HANDLE restarted = WaitForBackendRestart(GlobalState::g_ServerPort, Config::RESTART_WATCH_MS);
+            // 端口监听早于 loader/audit 完成。持续等待日志和 HTTP 认证，不使用 mtime 门槛。
+            GlobalState::g_Restarting = true;
+            std::string freshUrl;
+            LogMessage("INFO", "后台已退出，等待市场替补的认证就绪");
+            HANDLE restarted = WaitForBackendRestart(GlobalState::g_ServerPort, Config::AUTH_URL_TIMEOUT_MS, freshUrl);
             if (restarted != NULL) {
                 CloseHandle(GlobalState::g_BackendProcess);
                 GlobalState::g_BackendProcess = restarted;
-
-                // 市场发起的重启不是我们拉起的，拿不到它的 stdout；改用它的新 token 换一个新窗口，
-                // 页面因此必然已鉴权（旧窗口只靠 cookie，而 cookie 的失败模式不可控）。
-                std::wstring freshUrl;
                 std::string stdoutAcc;
-                if (ReadMarketRestartAuthUrl(exitTime, freshUrl)) {
-                    SwapAppWindow(freshUrl, NULL, stdoutAcc);
-                } else {
-                    LogMessage("WARN", "没取到替补 host 的认证 URL，保留旧窗口；"
-                                       "若窗口里显示鉴权失败，请退出后重开应用");
+                const bool swapped = !GlobalState::g_AppClosed
+                    && SwapAppWindow(FromUtf8(freshUrl), NULL, stdoutAcc);
+                GlobalState::g_Restarting = false;
+                if (!swapped) {
+                    LogMessage("ERROR", "新后台已通过 HTTP 鉴权，但换窗失败；本次重启未完成，退出并回收后台");
+                    running = false;
+                    continue;
                 }
-
-                LogMessage("INFO", "继续监督新的后台进程；托盘图标保持不动");
+                LogMessage("INFO", "市场重启完成：认证 URL 已验证，新窗口已接管，托盘保持不动");
                 continue;
             }
-            LogMessage("WARN", "后台没有回来，按真正结束处理");
+            GlobalState::g_Restarting = false;
+            LogMessage("ERROR", "没有取得已验证的替补后台，本次重启失败");
             running = false;
         } else if (waitRes == WAIT_OBJECT_0 + 1) {
             MSG msg;
